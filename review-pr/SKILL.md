@@ -24,6 +24,24 @@ Esta skill se ejecuta desde Claude Code, por lo tanto:
 - No necesitas clonar nada, solo hacer fetch.
 - Soporta repositorios en Azure DevOps, GitHub y GitLab.
 
+## Reglas de escritura en disco
+
+Esta skill **no debe dejar modificaciones persistentes en el proyecto**. Su única finalidad es revisar PRs.
+
+- **Archivos temporales permitidos**: se puede crear un archivo diff en la raíz del proyecto (ej: `review-pr-<PR_ID>.diff`) para poder leerlo por partes y ahorrar tokens frente a cargarlo entero en contexto. **Debe borrarse al finalizar** (ver [Paso 6](#paso-6-limpieza)).
+- **Ocultar el archivo de git**: antes de crearlo, registrar su nombre en `.git/info/exclude` para que no aparezca como untracked durante el análisis. Este archivo es el mecanismo oficial de git para exclusiones locales no versionadas (equivalente a un `.gitignore` personal que vive dentro de `.git/` y no se comparte). Existe en todo repo git desde su inicialización.
+
+  ```bash
+  TMP_DIFF="review-pr-<PR_ID>.diff"
+  grep -qxF "$TMP_DIFF" .git/info/exclude || echo "$TMP_DIFF" >> .git/info/exclude
+  ```
+
+  La línea agregada no hace falta revertirla: apunta a un archivo que ya no existirá después del análisis. El `grep -qxF ... || echo ...` evita duplicar la línea si se ejecuta la skill varias veces.
+- **No crear ni modificar** archivos en `.claude/`, `.vscode/`, `.idea/` ni cualquier otra carpeta de configuración del proyecto.
+- **No ejecutar operaciones que alteren el repo**: nada de `git add`, `git commit`, `git push`, `git reset`, `git checkout` a ramas, `git merge`, etc. Solo son aceptables: `git remote`, `git fetch`, `git diff`, `git symbolic-ref`, `git remote set-head`, y la escritura a `.git/info/exclude` descrita arriba.
+
+Si durante la ejecución Claude Code pide permisos para escribir algo fuera de los archivos listados aquí, esa es señal de que algo se está haciendo mal — revisar el procedimiento.
+
 ## Procedimiento
 
 ### Paso 1: Identificar el remoto y el proveedor
@@ -75,13 +93,19 @@ Si el fetch falla, el PR probablemente no existe o no tienes permisos para acced
 
 ### Paso 4: Análisis del diff
 
-Antes de presentar el reporte final, ejecuta los checks de calidad sobre el diff completo:
+Antes de presentar el reporte final, ejecuta los checks de calidad sobre el diff completo. Para evitar cargar el diff entero en contexto (costoso en tokens para PRs grandes), **persiste el diff en un archivo en la raíz del proyecto** y léelo por partes según lo necesite cada check.
+
+Antes de crearlo, registrar su nombre en `.git/info/exclude` para que no aparezca como untracked durante el análisis:
 
 ```bash
-git diff origin/<RAMA_PRINCIPAL>...FETCH_HEAD
+TMP_DIFF="review-pr-<PR_ID>.diff"
+grep -qxF "$TMP_DIFF" .git/info/exclude || echo "$TMP_DIFF" >> .git/info/exclude
+git diff origin/<RAMA_PRINCIPAL>...FETCH_HEAD > "$TMP_DIFF"
 ```
 
-Sobre esa salida corren los checks definidos más abajo en la sección [Checks de calidad](#checks-de-calidad). Cada check produce su propia sección del reporte. Si un check no encuentra hallazgos, esa sección se omite por completo del reporte.
+Sobre ese archivo corren los checks definidos más abajo en la sección [Checks de calidad](#checks-de-calidad). Cada check produce su propia sección del reporte. Si un check no encuentra hallazgos, esa sección se omite por completo del reporte.
+
+**Recordatorio:** el archivo debe borrarse al final (ver [Paso 6](#paso-6-limpieza) y [Reglas de escritura en disco](#reglas-de-escritura-en-disco)).
 
 **Alcance general de los checks:**
 - Se analizan únicamente las **líneas añadidas o modificadas** en el PR (líneas que empiezan con `+` en el diff, excluyendo la cabecera `+++`). No se analiza código preexistente que el autor no tocó.
@@ -96,6 +120,16 @@ Arma un reporte con esta estructura:
 3. **Secciones de checks**: una por cada check que haya producido hallazgos, en el orden en que aparecen en la sección [Checks de calidad](#checks-de-calidad). Si un check no encontró nada, se omite.
 
 Mantén el reporte **compacto**. No inventes datos — muestra exactamente lo que reporta git y lo que los checks detectaron.
+
+### Paso 6: Limpieza
+
+Una vez presentado el reporte, elimina el archivo temporal del diff:
+
+```bash
+rm -f "$TMP_DIFF"
+```
+
+Si por cualquier razón se crearon otros archivos temporales durante los checks, bórralos también aquí. La skill no debe dejar archivos residuales en el proyecto.
 
 ## Checks de calidad
 
