@@ -1,0 +1,51 @@
+{
+    "_comment": "Configuración de la skill TXW-deploy. Todos los paths del repo son RELATIVOS al working directory de Claude Code (que es la raíz del proyecto).",
+
+    "startup_project_relative_path": "TruextendWebsite.Web",
+    "_startup_project_note": "Ruta relativa (desde la raíz del repo) al proyecto web de arranque. Ajustá si la estructura es diferente.",
+
+    "ef_context": "CoreDbContext",
+    "ef_project_relative_path": "Modules\\Truextend.Core",
+    "migrations_folder_relative_path": "Modules\\Truextend.Core\\Migrations",
+    "_ef_note": "Rutas relativas al proyecto/migraciones de EF. Ajustá si la estructura es diferente.",
+
+    "build_output_path": "C:\\Users\\JavierMartinez\\source\\deploy builds\\TruextendWebsite\\build",
+    "_build_output_note": "Esta es la ruta donde el pubxml deja el build. Debe coincidir con <PublishDir> de FolderProfile.pubxml y FolderProfile.QA.pubxml",
+
+    "deploys_root": "C:\\Users\\JavierMartinez\\source\\deploy builds\\TruextendWebsite",
+    "_deploys_root_note": "Ahí se crean las carpetas YYYYMMDD-QA o YYYYMMDD-PROD localmente",
+
+    "drive_deploys_folder": "G:\\.shortcut-targets-by-id\\1_1h8V74Gc0SETXqY-Aqz3s01xomU5uYC\\Deploys",
+    "_drive_note": "Ruta local de la carpeta compartida de Drive via Drive para escritorio",
+
+    "git_status_whitelist": [
+        "appsettings.Development.json"
+    ],
+    "_whitelist_note": "Archivos cuyos cambios sin commitear se ignoran al validar git status",
+
+    "publish_profiles": {
+        "QA": "FolderProfile.QA",
+        "PROD": "FolderProfile"
+    },
+
+    "environment_constants": {
+        "QA": {
+            "iis_site_name": "truextendWebsiteQA",
+            "website_path": "C:\\inetpub\\truextendWebsiteQA",
+            "db_main_name": "TruextendWebsiteQA",
+            "db_core_name": "TxWebsiteCoreQA",
+            "appsettings_file": "appsettings.QA",
+            "appsettings_json_file": "appsettings.QA.json",
+            "zip_suffix": ""
+        },
+        "PROD": {
+            "iis_site_name": "truextend_com",
+            "website_path": "C:\\inetpub\\truextend_web_v2",
+            "db_main_name": "TruextendWebsiteDb",
+            "db_core_name": "TxWebsiteCore",
+            "appsettings_file": "appsettings",
+            "appsettings_json_file": "appsettings.json",
+            "zip_suffix": "_PROD"
+        }
+    }
+}

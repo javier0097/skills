@@ -1,0 +1,13 @@
+1. Backup of the db "TruextendWebsiteQA" and "TxWebsiteCoreQA"
+1.1 Obtain a backup of the folder "C:\inetpub\truextendWebsiteQA"
+
+2. Stop "truextendWebsiteQA" Web Site in IIS Manager Server
+
+3. Unzip and then copy the content of this file: {{ZIP_NAME}} to the source directory "C:\inetpub\truextendWebsiteQA"
+
+4. Copy QA configuration files:
+4.1 Copy the content of the backup do in 1.1 of App_Data folder, web.config and appsettings.QA file and replace the content in (C:\inetpub\truextendWebsiteQA)
+
+5. Run the script.sql file on TxWebsiteCoreQA database.
+
+6. Start "truextendWebsiteQA" Web Site in IIS Manager Server
