@@ -1,0 +1,9 @@
+1. Download the update-recipe.json file from the drive directory.
+
+2. Log in to truextend.com/admin.
+
+3. In the left side menu, go to configuration > import/export > package import.
+
+4. Click on "choose file" and select the update-recipe.json downloaded.
+
+5. Click on "Import".

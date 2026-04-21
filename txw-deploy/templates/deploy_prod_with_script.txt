@@ -1,0 +1,13 @@
+1. Backup of the db "TruextendWebsiteDb" and "TxWebsiteCore"
+1.1 Obtain a backup of the folder "C:\inetpub\truextend_web_v2"
+
+2. Stop "truextend_com" Web Site in IIS Manager Server
+
+3. Unzip and then copy the content of this file: {{ZIP_NAME}} to the source directory "C:\inetpub\truextend_web_v2"
+
+4. Copy production configuration files:
+4.1 Copy the content of the backup do in 1.1 of App_Data folder, web.config and appsettings file and replace the content in (C:\inetpub\truextend_web_v2)
+
+5. Run the script.sql file on TxWebsiteCore database.
+
+6. Start "truextend_com" Web Site in IIS Manager Server
