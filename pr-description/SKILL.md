@@ -24,7 +24,7 @@ Esta skill se ejecuta desde Claude Code, por lo tanto:
 1. **Nunca leer mensajes de commit.** El análisis se basa exclusivamente en el contenido del diff (archivos cambiados y líneas añadidas/modificadas). Los mensajes de commit suelen ser ruidosos y no representan fielmente la intención del PR.
 2. **Todo el output (título y descripción) va en inglés.** La conversación con el usuario puede ser en español.
 3. **No dejar rastros.** El archivo temporal de diff debe borrarse al final del procedimiento (ver [Paso 6](#paso-6-limpieza)).
-4. **No ejecutar operaciones destructivas.** Solo son aceptables: `git branch`, `git diff`, y la escritura en `.git/info/exclude`. Nada de `git add`, `commit`, `push`, `reset`, `checkout`, `merge`, etc.
+4. **No ejecutar operaciones destructivas.** Solo son aceptables: `git branch`, `git diff`, `git fetch` (para actualizar la referencia `origin/master`), y la escritura en `.git/info/exclude`. Nada de `git add`, `commit`, `push`, `reset`, `checkout`, `merge`, etc.
 
 ## Procedimiento
 
@@ -59,10 +59,20 @@ Antes de crearlo, registrar su nombre en `.git/info/exclude` para que no aparezc
 ```bash
 TMP_DIFF="pr-description.diff"
 grep -qxF "$TMP_DIFF" .git/info/exclude || echo "$TMP_DIFF" >> .git/info/exclude
-git diff master...HEAD > "$TMP_DIFF"
+git fetch origin master --quiet
+git diff origin/master...HEAD > "$TMP_DIFF"
 ```
 
-El operador `...` calcula el merge-base automáticamente, así que el diff muestra solo lo que esta rama introdujo respecto a master, no cambios que ocurrieron en master después de ramificar.
+**Por qué comparar contra `origin/master` y no contra `master` local:**
+
+Si el usuario hizo `git pull origin master` a su rama de trabajo (por ejemplo para resolver conflictos antes del PR), los commits de master entran a la rama vía un commit de merge. Si comparáramos contra un `master` local desactualizado, esos commits aparecerían como "cambios del PR" aunque no los haya hecho el usuario.
+
+Al actualizar la referencia `origin/master` con `git fetch origin master` y comparar contra ella:
+
+- `git fetch` solo actualiza la referencia remota — no toca el `master` local, no hace checkout, no altera el working directory ni la rama actual. Es una operación de solo lectura desde el punto de vista del usuario.
+- El operador `...` calcula el merge-base entre `origin/master` y `HEAD`. Los commits que vinieron del pull de master quedan en el merge-base (porque están en `origin/master`) y **no** aparecen en el diff.
+- Las resoluciones manuales de conflicto que el usuario escribió al mergear quedan dentro del commit de merge de su rama, que **no** está en `origin/master`, así que **sí** aparecen en el diff (correcto: son trabajo del usuario).
+- Los commits originales de la rama **sí** aparecen.
 
 Si el diff está vacío (archivo de 0 bytes), avisa al usuario que la rama no tiene cambios respecto a master y termina (después de la limpieza del Paso 6).
 
@@ -223,9 +233,9 @@ La línea agregada a `.git/info/exclude` no hace falta revertirla: apunta a un a
 ## Manejo de errores
 
 - **No se está en un repo git** (`git branch --show-current` falla): informa al usuario que la skill debe ejecutarse dentro de un repositorio.
-- **No existe la rama `master`**: informa al usuario. Esta skill asume que `master` es la rama base del proyecto.
+- **No existe el remoto `origin` o la rama `master` en el remoto** (`git fetch origin master` falla): informa al usuario. Esta skill asume que el repositorio tiene un remoto `origin` con una rama `master`.
 - **La rama actual es `master`**: informa al usuario que no tiene sentido generar una descripción de PR sobre la rama base.
-- **Diff vacío**: la rama no tiene cambios respecto a master. Informa y termina (tras limpieza).
+- **Diff vacío**: la rama no tiene cambios respecto a `origin/master`. Informa y termina (tras limpieza).
 
 ## Recordatorios finales
 
