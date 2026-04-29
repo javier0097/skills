@@ -194,6 +194,8 @@ Este paso usa dos scripts para minimizar tokens: uno para encontrar la carpeta c
        --output "<deploys_root>\<folder_name>\script.sql"
    ```
 
+   No uses `2>&1` al ejecutar este comando: dotnet escribe avisos benignos en stderr y eso puede generar falsos positivos. Validá el resultado revisando `$LASTEXITCODE` y la existencia del archivo de salida.
+
    Valida que `script.sql` se generó y no está vacío.
 
 4. Si `needs_script=false`, no hagas nada en este paso y continúa.
