@@ -30,7 +30,10 @@ catch {
     exit 1
 }
 
-$statusOutput = git status --porcelain 2>&1
+# IMPORTANTE: No usar `2>&1`. En Windows PowerShell 5.1, eso convierte cualquier
+# escritura a stderr (avisos benignos de git, hints, etc.) en NativeCommandError,
+# que con $ErrorActionPreference="Stop" aborta el script aunque git haya salido con 0.
+$statusOutput = git status --porcelain
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Error al ejecutar git status: $statusOutput"
     exit 1

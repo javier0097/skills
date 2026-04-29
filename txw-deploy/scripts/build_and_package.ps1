@@ -47,9 +47,13 @@ if (Test-Path $BuildOutputPath) {
     Remove-Item -Recurse -Force $BuildOutputPath
 }
 
-# El comando dotnet publish se ejecuta desde el working directory actual
-# (no hacemos Push-Location porque el path relativo ya funciona desde acá)
-$publishOutput = dotnet publish $StartupProjectRelativePath -p:PublishProfile=$PublishProfile --configuration Release 2>&1
+# El comando dotnet publish se ejecuta desde el working directory actual.
+# IMPORTANTE: No usar `2>&1` para mezclar stderr con stdout. En Windows PowerShell 5.1
+# eso convierte cualquier escritura a stderr (incluso informativa) en NativeCommandError,
+# que con $ErrorActionPreference="Stop" aborta el script aunque dotnet haya salido con 0.
+# Capturamos solo stdout en la variable; stderr va por su canal natural y solo lo
+# vemos si dotnet falla (en cuyo caso el output capturado suele tener el detalle).
+$publishOutput = dotnet publish $StartupProjectRelativePath -p:PublishProfile=$PublishProfile --configuration Release
 $publishExitCode = $LASTEXITCODE
 
 if ($publishExitCode -ne 0) {
