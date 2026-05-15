@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: "Revisa pull requests en repositorios Azure DevOps, GitHub o GitLab usando solo git (sin CLIs ni APIs REST). Se invoca EXCLUSIVAMENTE con el slash command /review-pr seguido del ID del PR. Ejemplo: /review-pr 1234. NUNCA activar esta skill por contexto o inferencia — solo cuando el usuario escriba literalmente /review-pr. El PR se analiza sobre el repositorio del proyecto actual en la conversación de Claude Code."
+description: "Revisa pull requests en repositorios Azure DevOps, GitHub o GitLab usando solo git (sin CLIs ni APIs REST). Se invoca EXCLUSIVAMENTE con el slash command /review-pr seguido del ID del PR. Ejemplo: /review-pr 1234. La rama base contra la que se compara es `develop` por defecto, pero el usuario puede especificar `staging` o `master` en el prompt. NUNCA activar esta skill por contexto o inferencia — solo cuando el usuario escriba literalmente /review-pr. El PR se analiza sobre el repositorio del proyecto actual en la conversación de Claude Code."
 ---
 
 # Review PR
@@ -11,10 +11,10 @@ Revisa un pull request (o merge request en GitLab) utilizando únicamente comand
 
 Solo por slash command:
 ```
-/review-pr <PR_ID>
+/review-pr <PR_ID> [<rama_base>]
 ```
 
-Donde `<PR_ID>` es el número del pull request (o merge request en GitLab).
+Donde `<PR_ID>` es el número del pull request (o merge request en GitLab). Opcionalmente, el usuario puede mencionar en el prompt la rama base contra la que comparar (ver Paso 2 para las reglas de resolución).
 
 ## Contexto importante
 
@@ -23,6 +23,7 @@ Esta skill se ejecuta desde Claude Code, por lo tanto:
 - Git ya está configurado con las credenciales necesarias para acceder al remoto.
 - No necesitas clonar nada, solo hacer fetch.
 - Soporta repositorios en Azure DevOps, GitHub y GitLab.
+- Las ramas base válidas son: `develop`, `staging`, `master`. Por defecto se compara contra `develop`.
 
 ## Reglas de escritura en disco
 
@@ -38,7 +39,7 @@ Esta skill **no debe dejar modificaciones persistentes en el proyecto**. Su úni
 
   La línea agregada no hace falta revertirla: apunta a un archivo que ya no existirá después del análisis. El `grep -qxF ... || echo ...` evita duplicar la línea si se ejecuta la skill varias veces.
 - **No crear ni modificar** archivos en `.claude/`, `.vscode/`, `.idea/` ni cualquier otra carpeta de configuración del proyecto.
-- **No ejecutar operaciones que alteren el repo**: nada de `git add`, `git commit`, `git push`, `git reset`, `git checkout` a ramas, `git merge`, etc. Solo son aceptables: `git remote`, `git fetch`, `git diff`, `git symbolic-ref`, `git remote set-head`, y la escritura a `.git/info/exclude` descrita arriba.
+- **No ejecutar operaciones que alteren el repo**: nada de `git add`, `git commit`, `git push`, `git reset`, `git checkout` a ramas, `git merge`, etc. Solo son aceptables: `git remote`, `git fetch`, `git diff`, y la escritura a `.git/info/exclude` descrita arriba.
 
 Si durante la ejecución Claude Code pide permisos para escribir algo fuera de los archivos listados aquí, esa es señal de que algo se está haciendo mal — revisar el procedimiento.
 
@@ -56,40 +57,60 @@ Si no coincide con ninguno, informa al usuario que la skill solo soporta Azure D
 
 Guarda el proveedor detectado porque determina la ref a usar en el paso 3.
 
-### Paso 2: Obtener la rama principal del repositorio
+### Paso 2: Resolver la rama base del PR
 
-Git local no tiene concepto de "rama principal" — eso lo define el servidor remoto. Para consultarla, ejecuta:
+Analizá el prompt del usuario que invocó la skill para detectar **menciones literales** de las ramas base válidas: `develop`, `staging`, `master`.
+
+**Reglas de resolución:**
+
+- **Ninguna mención** → rama base = `develop` (default).
+- **Exactamente una mención** → rama base = esa rama.
+- **Dos o más menciones distintas** → ambiguo. **Pedí aclaración al usuario** mostrándole las ramas detectadas y preguntando cuál es la rama destino del PR. Detené el procedimiento hasta tener respuesta clara (una sola de las tres ramas).
+
+**Detección:** buscá las palabras `develop`, `staging`, `master` como tokens completos en el prompt (no como subcadenas de otras palabras). Variaciones aceptables: minúsculas, mayúsculas, entre comillas, con/sin preposición previa (`hacia master`, `vs staging`, `base: develop`).
+
+**Ejemplos:**
+
+| Prompt | Rama resuelta |
+|---|---|
+| `/review-pr 1234` | `develop` |
+| `/review-pr 1234 hacia staging` | `staging` |
+| `/review-pr 1234 vs master` | `master` |
+| `/review-pr 1234 revisar el hotfix` | `develop` (ninguna mención literal) |
+| `/review-pr 1234 es el merge de develop a master` | **ambiguo** → pedir aclaración |
+
+**Importante:** una vez resuelta la rama base, **no preguntes al usuario para confirmar**. Seguí directo con el procedimiento. Solo se pregunta cuando hay ambigüedad.
+
+Guardá el nombre de la rama base resuelta como `BASE_BRANCH`. Se usa en los pasos siguientes y se muestra explícitamente en el encabezado del reporte final (Paso 5) para que el usuario verifique que se comparó contra la rama correcta.
+
+### Paso 3: Fetch de la rama base, fetch del PR, y diff
+
+Cada proveedor expone los PRs como refs especiales con distinto formato. Hacé los fetch en este orden:
+
+1. **Primero la rama base** resuelta en el Paso 2, para asegurar que la referencia local `origin/$BASE_BRANCH` esté actualizada.
+2. **Después el PR**, usando la ref que corresponda al proveedor detectado en el Paso 1.
+
+El orden importa porque el `git diff` siguiente usa `FETCH_HEAD`, que apunta al último fetch realizado — necesitamos que apunte al PR, no a la rama base.
 
 ```bash
-git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'
+# 1. Fetch de la rama base
+git fetch origin "$BASE_BRANCH" --quiet
+
+# 2. Fetch del PR (elegí según proveedor)
+# Azure DevOps o GitHub:
+git fetch origin "refs/pull/<PR_ID>/head"
+# GitLab:
+# git fetch origin "refs/merge-requests/<PR_ID>/head"
+
+# 3. Diff del PR contra la rama base
+git diff --stat "origin/$BASE_BRANCH...FETCH_HEAD"
 ```
 
-Si no devuelve resultado (puede pasar si el repo se inició con `git init` + `git remote add` en lugar de `git clone`), crea la referencia consultando directamente al servidor:
+El operador `...` calcula automáticamente el merge-base entre `origin/$BASE_BRANCH` y `FETCH_HEAD`, eliminando la necesidad de hacerlo manualmente.
 
-```bash
-git remote set-head origin --auto
-```
-
-Y luego vuelve a ejecutar el primer comando. Si aún así falla, informa al usuario que no se pudo determinar la rama principal del remoto.
-
-Guarda el nombre de esa rama (ej: `main`, `master`, `develop`, etc.) para usarla en el paso siguiente.
-
-### Paso 3: Fetch del PR y diff en dos comandos
-
-Cada proveedor expone los PRs como refs especiales con distinto formato. Haz fetch usando la ref que corresponda al proveedor detectado en el paso 1:
-
-- **Azure DevOps o GitHub**: `git fetch origin refs/pull/<PR_ID>/head`
-- **GitLab**: `git fetch origin refs/merge-requests/<PR_ID>/head`
-
-Luego compara contra la rama principal usando el operador triple-punto (`...`), que calcula el merge-base automáticamente:
-
-```bash
-git diff --stat origin/<RAMA_PRINCIPAL>...FETCH_HEAD
-```
-
-`FETCH_HEAD` apunta automáticamente a lo que acabas de descargar, así que no necesitas crear refs locales. El operador `...` se encarga de encontrar el ancestro común, eliminando la necesidad de calcular el merge-base manualmente.
-
-Si el fetch falla, el PR probablemente no existe o no tienes permisos para acceder al repositorio. Informa al usuario.
+**Manejo de fallos:**
+- Si el fetch de la rama base falla → la rama resuelta no existe en el remoto. Informá al usuario y aborta.
+- Si el fetch del PR falla → el PR probablemente no existe o no tenés permisos. Informá al usuario y aborta.
 
 ### Paso 4: Análisis del diff
 
@@ -100,7 +121,7 @@ Antes de crearlo, registrar su nombre en `.git/info/exclude` para que no aparezc
 ```bash
 TMP_DIFF="review-pr-<PR_ID>.diff"
 grep -qxF "$TMP_DIFF" .git/info/exclude || echo "$TMP_DIFF" >> .git/info/exclude
-git diff origin/<RAMA_PRINCIPAL>...FETCH_HEAD > "$TMP_DIFF"
+git diff "origin/$BASE_BRANCH...FETCH_HEAD" > "$TMP_DIFF"
 ```
 
 Sobre ese archivo corren los checks definidos más abajo en la sección [Checks de calidad](#checks-de-calidad). Cada check produce su propia sección del reporte. Si un check no encuentra hallazgos, esa sección se omite por completo del reporte.
@@ -115,7 +136,7 @@ Sobre ese archivo corren los checks definidos más abajo en la sección [Checks 
 
 Arma un reporte con esta estructura:
 
-1. **Encabezado**: ID del PR revisado y rama principal contra la que se comparó.
+1. **Encabezado**: ID del PR revisado y rama base contra la que se comparó. **Mostrá la rama base de forma explícita y visible** para que el usuario pueda detectar inmediatamente si se comparó contra la rama equivocada. Ejemplo de formato: `Reviewing PR #1234 against origin/develop`.
 2. **Resumen estadístico**: la salida de `git diff --stat` (archivos modificados, inserciones, eliminaciones).
 3. **Secciones de checks**: una por cada check que haya producido hallazgos, en el orden en que aparecen en la sección [Checks de calidad](#checks-de-calidad). Si un check no encontró nada, se omite.
 
@@ -214,8 +235,10 @@ Reglas de formato:
 ## Manejo de errores
 
 - Si el PR ID no es un número válido, pide al usuario que verifique.
-- Si el fetch falla, puede ser que el PR no exista o que no tengas permisos para acceder al repositorio. Informa claramente.
+- Si el fetch de la rama base falla, la rama resuelta (`develop`, `staging` o `master`) no existe en el remoto. Informa indicando cuál fue la rama base resuelta y aborta.
+- Si el fetch del PR falla, puede ser que el PR no exista o que no tengas permisos para acceder al repositorio. Informa claramente.
 - Si el remoto no corresponde a Azure DevOps, GitHub ni GitLab, indica que la skill no soporta ese proveedor.
+- **Rama base ambigua en el prompt**: si se detectó más de una mención literal de las ramas válidas, no resolver automáticamente — pedir aclaración al usuario y detener el procedimiento hasta tener respuesta (ver Paso 2).
 
 ## Notas para evolución futura
 
