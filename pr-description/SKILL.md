@@ -1,11 +1,11 @@
 ---
 name: pr-description
-description: "Genera el título y la descripción de un pull request en inglés, basándose únicamente en los cambios de código respecto a master (no en los mensajes de commit). Se invoca con el slash command /pr-description, o cuando el usuario pida explícitamente generar/redactar la descripción, el título o el mensaje de un PR, merge request, o pull request. Actívala siempre que el usuario mencione 'descripción de PR', 'título de PR', 'mensaje de PR', 'PR description', o pida ayuda para documentar un pull request sobre el repositorio actual de Claude Code."
+description: "Genera el título y la descripción de un pull request en inglés, basándose únicamente en los cambios de código (no en los mensajes de commit). La rama base contra la que se compara es `develop` por defecto, pero el usuario puede especificar `staging` o `master` en el prompt. Se invoca con el slash command /pr-description, o cuando el usuario pida explícitamente generar/redactar la descripción, el título o el mensaje de un PR, merge request, o pull request. Actívala siempre que el usuario mencione 'descripción de PR', 'título de PR', 'mensaje de PR', 'PR description', o pida ayuda para documentar un pull request sobre el repositorio actual de Claude Code."
 ---
 
 # PR Description
 
-Genera el título y la descripción de un pull request analizando el diff del branch actual contra `master`. Todo el contenido producido va en inglés.
+Genera el título y la descripción de un pull request analizando el diff del branch actual contra la rama base correspondiente. La rama base se resuelve desde el prompt del usuario; por defecto es `develop`. Todo el contenido producido va en inglés.
 
 ## Invocación
 
@@ -17,16 +17,43 @@ Genera el título y la descripción de un pull request analizando el diff del br
 Esta skill se ejecuta desde Claude Code, por lo tanto:
 - Ya estás dentro del repositorio del proyecto.
 - Git ya está configurado y la rama de trabajo está activa.
-- La rama base contra la que se compara es siempre `master`.
+- Las ramas base válidas son: `develop`, `staging`, `master`. Por defecto se compara contra `develop`.
 
 ## Reglas inviolables
 
 1. **Nunca leer mensajes de commit.** El análisis se basa exclusivamente en el contenido del diff (archivos cambiados y líneas añadidas/modificadas). Los mensajes de commit suelen ser ruidosos y no representan fielmente la intención del PR.
 2. **Todo el output (título y descripción) va en inglés.** La conversación con el usuario puede ser en español.
-3. **No dejar rastros.** El archivo temporal de diff debe borrarse al final del procedimiento (ver [Paso 6](#paso-6-limpieza)).
-4. **No ejecutar operaciones destructivas.** Solo son aceptables: `git branch`, `git diff`, `git fetch` (para actualizar la referencia `origin/master`), y la escritura en `.git/info/exclude`. Nada de `git add`, `commit`, `push`, `reset`, `checkout`, `merge`, etc.
+3. **No dejar rastros.** El archivo temporal de diff debe borrarse al final del procedimiento (ver [Paso 8](#paso-8-limpieza)).
+4. **No ejecutar operaciones destructivas.** Solo son aceptables: `git branch`, `git diff`, `git fetch` (para actualizar la referencia `origin/<base>`), y la escritura en `.git/info/exclude`. Nada de `git add`, `commit`, `push`, `reset`, `checkout`, `merge`, etc.
 
 ## Procedimiento
+
+### Paso 0: Resolver la rama base del PR
+
+Analizá el prompt del usuario que invocó la skill para detectar **menciones literales** de las ramas base válidas: `develop`, `staging`, `master`.
+
+**Reglas de resolución:**
+
+- **Ninguna mención** → rama base = `develop` (default).
+- **Exactamente una mención** → rama base = esa rama.
+- **Dos o más menciones distintas** → ambiguo. **Pedí aclaración al usuario** mostrándole las ramas detectadas y preguntando cuál es la rama destino del PR. Detené el procedimiento hasta tener respuesta clara (una sola de las tres ramas).
+
+**Detección:** buscá las palabras `develop`, `staging`, `master` como tokens completos en el prompt (no como subcadenas de otras palabras). Variaciones aceptables: minúsculas, mayúsculas, entre comillas, con/sin preposición previa (`hacia master`, `vs staging`, `base: develop`).
+
+**Ejemplos:**
+
+| Prompt | Rama resuelta |
+|---|---|
+| `/pr-description` | `develop` |
+| `/pr-description hacia staging` | `staging` |
+| `/pr-description vs master` | `master` |
+| `/pr-description el PR del hotfix de login` | `develop` (ninguna mención literal) |
+| `/pr-description necesito describir el merge de develop a master` | **ambiguo** → pedir aclaración |
+| `/pr-description tiene un cherry-pick de staging` | `staging` (una sola mención) |
+
+**Importante:** una vez resuelta la rama base, **no preguntes al usuario para confirmar**. Seguí directo con el procedimiento. Solo se pregunta cuando hay ambigüedad.
+
+Guarda el nombre de la rama base resuelta como `BASE_BRANCH`. Se usa en los pasos siguientes.
 
 ### Paso 1: Obtener el nombre de la rama actual
 
@@ -59,22 +86,22 @@ Antes de crearlo, registrar su nombre en `.git/info/exclude` para que no aparezc
 ```bash
 TMP_DIFF="pr-description.diff"
 grep -qxF "$TMP_DIFF" .git/info/exclude || echo "$TMP_DIFF" >> .git/info/exclude
-git fetch origin master --quiet
-git diff origin/master...HEAD > "$TMP_DIFF"
+git fetch origin "$BASE_BRANCH" --quiet
+git diff "origin/$BASE_BRANCH...HEAD" > "$TMP_DIFF"
 ```
 
-**Por qué comparar contra `origin/master` y no contra `master` local:**
+**Por qué comparar contra `origin/<base>` y no contra la rama base local:**
 
-Si el usuario hizo `git pull origin master` a su rama de trabajo (por ejemplo para resolver conflictos antes del PR), los commits de master entran a la rama vía un commit de merge. Si comparáramos contra un `master` local desactualizado, esos commits aparecerían como "cambios del PR" aunque no los haya hecho el usuario.
+Si el usuario hizo `git pull origin <base>` a su rama de trabajo (por ejemplo para resolver conflictos antes del PR), los commits de la rama base entran a la rama vía un commit de merge. Si comparáramos contra una rama base local desactualizada, esos commits aparecerían como "cambios del PR" aunque no los haya hecho el usuario.
 
-Al actualizar la referencia `origin/master` con `git fetch origin master` y comparar contra ella:
+Al actualizar la referencia `origin/<base>` con `git fetch origin <base>` y comparar contra ella:
 
-- `git fetch` solo actualiza la referencia remota — no toca el `master` local, no hace checkout, no altera el working directory ni la rama actual. Es una operación de solo lectura desde el punto de vista del usuario.
-- El operador `...` calcula el merge-base entre `origin/master` y `HEAD`. Los commits que vinieron del pull de master quedan en el merge-base (porque están en `origin/master`) y **no** aparecen en el diff.
-- Las resoluciones manuales de conflicto que el usuario escribió al mergear quedan dentro del commit de merge de su rama, que **no** está en `origin/master`, así que **sí** aparecen en el diff (correcto: son trabajo del usuario).
+- `git fetch` solo actualiza la referencia remota — no toca la rama base local, no hace checkout, no altera el working directory ni la rama actual. Es una operación de solo lectura desde el punto de vista del usuario.
+- El operador `...` calcula el merge-base entre `origin/<base>` y `HEAD`. Los commits que vinieron del pull de la rama base quedan en el merge-base (porque están en `origin/<base>`) y **no** aparecen en el diff.
+- Las resoluciones manuales de conflicto que el usuario escribió al mergear quedan dentro del commit de merge de su rama, que **no** está en `origin/<base>`, así que **sí** aparecen en el diff (correcto: son trabajo del usuario).
 - Los commits originales de la rama **sí** aparecen.
 
-Si el diff está vacío (archivo de 0 bytes), avisa al usuario que la rama no tiene cambios respecto a master y termina (después de la limpieza del Paso 6).
+Si el diff está vacío (archivo de 0 bytes), avisa al usuario que la rama no tiene cambios respecto a `origin/<base>` y termina (después de la limpieza del Paso 8). Este caso cubre tanto "estás parado en la rama base" como "tu rama está al día con la base sin commits propios".
 
 ### Paso 4: Analizar los cambios
 
@@ -154,11 +181,100 @@ El umbral no es cuantitativo (líneas cambiadas) sino cualitativo. Un refactor d
 
 Todo en inglés. Basado exclusivamente en los cambios del diff.
 
+#### Principio rector: describí comportamiento, no implementación
+
+La descripción debe **agregar valor sobre lo que el reviewer ya ve en el diff**. Hablá de **comportamientos, procesos, efectos y razones**; no de la mecánica del código. Si una oración puede verificarse trivialmente abriendo los archivos del PR, está de más.
+
+**Heurística operativa.** Antes de escribir cada oración, preguntate:
+
+1. **¿Esto se ve trivialmente en el diff?**
+   - Si **no** se ve (cambios de comportamiento, flujos, efectos, vistas nuevas, razones) → incluilo.
+   - Si **sí** se ve → preguntate si hay una forma de decirlo en términos de comportamiento o efecto. Si la hay → usá esa. Si no la hay → ver el punto 2.
+
+2. **¿Esto le ahorra tiempo al reviewer o le cambia cómo lee el código?** Si sí, mantenelo aunque suene técnico. Si no, omitilo.
+
+**Cuándo es aceptable ser técnico** (no hay que forzar abstracción artificial):
+
+- **PR muy chico / cambio aislado** (típicamente config, constantes, un ajuste en un solo lugar). Forzar lenguaje comportamental sobre dos líneas de cambio suena inflado. Sé directo.
+- **Refactors.** A menudo el contenido del PR *es* técnico. Mantenete al nivel de "qué componentes se reorganizaron y bajo qué criterio", **no** descender a "cambié esta variable por esta otra" o "renombré este método".
+- **Cuando no hay material comportamental que describir.** En lugar de inflar con jerga, sé directo y breve.
+
+**Anti-patrones a evitar siempre que se pueda** (especialmente en `feature` y `bug`):
+
+- ❌ Mencionar nombres específicos de variables, métodos, clases, archivos.
+- ❌ Mencionar la tecnología o librería usada para implementar algo ("uses regex", "via LINQ", "with Entity Framework").
+- ❌ Frases tipo "added a variable / flag / property / field / struct / method called X".
+- ❌ Describir estructuras de datos campo por campo.
+- ❌ Mencionar el endpoint o ruta agregada (el reviewer lo encuentra fácil en el diff).
+
+**Matiz por tipo de PR:**
+
+- **`feature`**: la regla aplica fuerte. Casi siempre hay material comportamental que describir.
+- **`bug`**: describí **qué estaba mal** (síntoma observable) y **cómo se comporta ahora** (corrección). Si la corrección introduce un comportamiento nuevo distinto, describilo en términos comportamentales también. Evitá los detalles técnicos del fix; el reviewer los ve en el diff.
+- **`refactor`**: a menudo el tecnicismo es inevitable porque el cambio es estructural. Resumí los componentes refactorizados y el criterio, lo más abstracto que se pueda sin perder utilidad.
+
+#### Ejemplos contrastivos
+
+**Feature:**
+
+❌ Demasiado técnico:
+```
+Added a `validateEmail` method to `UserService.cs` that uses regex to
+check the format. Also added a new `EmailValidationException` class and
+exposed a new POST /api/users/validate-email endpoint that returns 400
+when the format is invalid.
+```
+
+✅ Comportamental:
+```
+Adds email format validation to user registration. Users now receive a
+clear error message before submission instead of seeing the request fail
+silently downstream.
+```
+
+**Bug:**
+
+❌ Demasiado técnico:
+```
+Fixed a null reference exception in `LoginController.HandleAsync` by
+adding a null check on the `refreshToken` parameter before calling
+`tokenService.Validate()`.
+```
+
+✅ Comportamental:
+```
+Fixes a crash that occurred when users tried to log in with an expired
+session whose refresh token had already been cleared. The login flow now
+redirects to the login page instead of returning a 500 error.
+```
+
+**Refactor (caso donde el tecnicismo es razonable):**
+
+✅ Aceptable:
+```
+Extracts payment validation logic out of the order processing service
+into its own dedicated component. The new component groups previously
+scattered validation rules under a single entry point, making it easier
+to add new payment providers without touching order processing.
+```
+
+(Notá que no menciona nombres de clases específicas ni archivos — habla de "payment validation logic" y "order processing service" como conceptos. Esto está bien para refactor.)
+
+**PR chico (config / cambio aislado):**
+
+✅ Aceptable ser directo:
+```
+Enables Information-level logging for the application by configuring
+the Logging section in the environment settings.
+```
+
+(Acá forzar una descripción puramente comportamental sería artificial. La descripción menciona el nivel concreto porque es información útil que no es trivial inferir.)
+
 #### Caso A: una sola tarea
 
 Descripción en **prosa** (uno o dos párrafos breves). Explica:
-1. Qué hace el PR (el objetivo principal).
-2. Si hace falta, un segundo párrafo con detalles relevantes que el reviewer debería saber (ej: nuevo endpoint expuesto, cambio en el flujo de X, etc.).
+1. Qué hace el PR (el objetivo principal, en términos comportamentales).
+2. Si hace falta, un segundo párrafo con detalles relevantes que el reviewer debería saber sobre el comportamiento, no sobre la implementación (ej: cambio en el flujo de X, side effect en Y, restricción nueva sobre Z).
 
 No uses viñetas en este caso.
 
@@ -175,7 +291,7 @@ the UI.
 
 #### Caso B: varias tareas no relacionadas
 
-Descripción en **viñetas**, un punto por tarea. Cada punto debe ser autocontenido y describir esa tarea completa.
+Descripción en **viñetas**, un punto por tarea. Cada punto debe ser autocontenido y describir esa tarea completa **en términos comportamentales**.
 
 **Ejemplo:**
 ```
@@ -233,9 +349,9 @@ La línea agregada a `.git/info/exclude` no hace falta revertirla: apunta a un a
 ## Manejo de errores
 
 - **No se está en un repo git** (`git branch --show-current` falla): informa al usuario que la skill debe ejecutarse dentro de un repositorio.
-- **No existe el remoto `origin` o la rama `master` en el remoto** (`git fetch origin master` falla): informa al usuario. Esta skill asume que el repositorio tiene un remoto `origin` con una rama `master`.
-- **La rama actual es `master`**: informa al usuario que no tiene sentido generar una descripción de PR sobre la rama base.
-- **Diff vacío**: la rama no tiene cambios respecto a `origin/master`. Informa y termina (tras limpieza).
+- **No existe el remoto `origin` o la rama base resuelta en el remoto** (`git fetch origin <base>` falla): informa al usuario indicando cuál fue la rama base resuelta. Esta skill asume que el repositorio tiene un remoto `origin` con la rama base disponible.
+- **Diff vacío**: la rama no tiene cambios respecto a `origin/<base>`. Informa y termina (tras limpieza). Este caso también cubre el escenario "estás parado en la rama base".
+- **Rama base ambigua en el prompt**: si se detectó más de una mención literal de las ramas válidas, no resolver automáticamente — pedir aclaración al usuario y detener el procedimiento hasta tener respuesta (ver Paso 0).
 
 ## Recordatorios finales
 
