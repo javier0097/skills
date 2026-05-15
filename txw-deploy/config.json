@@ -28,6 +28,18 @@
         "PROD": "FolderProfile"
     },
 
+    "branches": {
+        "QA": {
+            "target": "staging",
+            "expected_sources": ["develop", "master"]
+        },
+        "PROD": {
+            "target": "master",
+            "expected_sources": ["staging"]
+        }
+    },
+    "_branches_note": "Configuración del gitflow. 'target' es la rama desde la que se hace el deploy al ambiente. 'expected_sources' son las ramas que deberían estar propagadas en target; si hay commits en alguna de ellas que no estén en target, la skill muestra los commits y pide confirmación antes de deployar.",
+
     "environment_constants": {
         "QA": {
             "iis_site_name": "truextendWebsiteQA",

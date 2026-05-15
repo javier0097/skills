@@ -70,32 +70,95 @@ Sigue este orden estrictamente. Valida el éxito de cada paso antes de avanzar a
 1. Lee `"$SKILL_BASE\config.json"`.
 2. Parsea el prompt del usuario para extraer: `environment` (QA/PROD), `has_recipe` (bool), `special_instructions` (string libre o null).
 3. Si falta el ambiente, pídelo con una sola pregunta y detente hasta tener respuesta.
-4. Valida git status con el siguiente comando, **pasando explícitamente el whitelist como parámetro** (construilo a partir de `config.json[git_status_whitelist]`):
-
-   ```powershell
-   pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\check_git_status.ps1" -Whitelist "appsettings.Development.json"
-   ```
-
-   Si el whitelist tuviera más de un archivo, pasá `-Whitelist "a.json","b.json"` (separados por coma, sin espacios).
-
-   Si el script retorna exit code 1 ("DIRTY"), aborta mostrando qué archivos tienen cambios sin commitear.
-
-5. Determina el publish profile correspondiente según `config.json[publish_profiles]`:
+4. Determina el publish profile correspondiente según `config.json[publish_profiles]`:
    - `QA` → `FolderProfile.QA`
    - `PROD` → `FolderProfile`
 
-6. Calculá la fecha actual en formato `YYYYMMDD` (zona horaria local de la laptop).
+5. Calculá la fecha actual en formato `YYYYMMDD` (zona horaria local de la laptop).
 
-### Paso 2 — Git
+### Paso 2 — Validación de git y preparación de la rama
 
-Ejecuta en el working directory (que es la raíz del proyecto):
+Este paso unifica todas las validaciones de git previas al deploy: working directory limpio, sincronización local con el remoto, y propagación de commits desde las ramas fuente esperadas.
 
-```powershell
-git checkout master
-git pull
-```
+1. Determiná la rama objetivo y las fuentes esperadas leyendo `config.json[branches][<environment>]`:
+   - `QA` → target: `staging`, expected_sources: `develop`, `master`
+   - `PROD` → target: `master`, expected_sources: `staging`
 
-Si alguno falla, aborta.
+2. Ejecutá el script de readiness:
+
+   ```powershell
+   pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\check_deploy_readiness.ps1" `
+       -TargetBranch "<target>" `
+       -ExpectedSources "<source1>","<source2>" `
+       -Whitelist "<whitelist_de_config>"
+   ```
+
+   El script hace internamente, en este orden:
+   - Valida que el working directory esté limpio (ignora archivos del whitelist).
+   - `git fetch` de la rama objetivo y todas las fuentes.
+   - Si la rama objetivo no existe localmente, la crea desde `origin/<target>`.
+   - `git checkout <target>`.
+   - Calcula si la rama local está sincronizada con `origin/<target>`. Si está atrasada y limpia, hace `git pull --ff-only`. Si está adelantada o divergente, aborta.
+   - Cuenta y lista los commits de cada `expected_source` que no estén en `origin/<target>` (hasta 10 por fuente).
+
+3. Salida JSON del script:
+
+   ```json
+   {
+       "ok": true,
+       "working_directory": {
+           "status": "clean",
+           "files": []
+       },
+       "local_sync": {
+           "status": "ok",
+           "ahead_count": 0,
+           "behind_count": 0
+       },
+       "propagation": [
+           {
+               "source": "develop",
+               "missing_count": 3,
+               "missing_commits": [
+                   { "sha": "abc1234", "message": "feat: nuevo endpoint" },
+                   { "sha": "def5678", "message": "fix: validación" },
+                   { "sha": "ghi9012", "message": "chore: deps" }
+               ]
+           },
+           {
+               "source": "master",
+               "missing_count": 0,
+               "missing_commits": []
+           }
+       ]
+   }
+   ```
+
+   Estados posibles:
+   - `working_directory.status`: `"clean"`, `"dirty"`, `"error"`.
+   - `local_sync.status`: `"ok"` (al día), `"behind"` (estaba atrasado, ya hizo ff), `"ahead"` (bloqueante), `"diverged"` (bloqueante), `"error"`, `"not_checked"`.
+
+4. **Manejo del resultado:**
+
+   - Si `ok=false` (exit code 1): aborta el deploy. Mostrá al usuario el campo `error` y los detalles relevantes (archivos dirty, contadores ahead/behind, etc.) para que pueda corregir antes de reintentar.
+
+   - Si `ok=true` pero alguna entrada de `propagation` tiene `missing_count > 0`: **mostrá al usuario la lista de commits faltantes por cada fuente** y pedí confirmación explícita antes de seguir. Formato sugerido:
+
+     > Detecté commits en ramas fuente que no están en `<target>`:
+     >
+     > **`develop`** — 3 commits sin propagar:
+     >   - abc1234 feat: nuevo endpoint
+     >   - def5678 fix: validación
+     >   - ghi9012 chore: deps
+     >
+     > **`master`** — 1 commit sin propagar:
+     >   - xyz9876 hotfix: corrección urgente en login
+     >
+     > Esto suele indicar que falta hacer un PR (de `develop` → `<target>` o `master` → `<target>` si es un hotfix). ¿Querés seguir con el deploy de todas formas?
+
+     Si el usuario no responde afirmativamente de forma clara (`sí`, `seguir`, `s`, etc.), **abortá el deploy**. Default seguro: ante duda, no avanzar.
+
+   - Si `ok=true` y todas las propagaciones tienen `missing_count=0`: seguí con el Paso 3 sin preguntar nada.
 
 ### Paso 3 — Resolver nombre de carpeta de deploy y del zip
 
@@ -236,7 +299,10 @@ Si `has_recipe=true`:
 
 ## Manejo de errores
 
-- Si `git status` tiene cambios fuera del whitelist → aborta y pide al usuario que haga commit/stash primero.
+- Si el check de readiness falla con `working_directory.status="dirty"` → aborta y pide al usuario que haga commit/stash primero.
+- Si el check de readiness falla con `local_sync.status="ahead"` → aborta y pide al usuario que haga `git push` antes de deployar.
+- Si el check de readiness falla con `local_sync.status="diverged"` → aborta y pide al usuario que resuelva el merge/rebase antes de deployar.
+- Si hay commits sin propagar (`propagation[].missing_count > 0`) y el usuario no confirma explícitamente → aborta.
 - Si `dotnet publish` falla → muestra la última parte del output y aborta.
 - Si falta el publish profile esperado → aborta indicando el path que esperaba.
 - Si la detección de migraciones no encuentra scripts pasados del ambiente → aborta e informa.
