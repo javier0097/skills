@@ -8,12 +8,20 @@
 #      - Si está al día: no-op.
 #      - Si está atrasado y limpio: avanza con fast-forward.
 #      - Si está adelantado o divergente: aborta con error.
-#   6. Checks de propagación: cuenta y lista los commits que están en cada
-#      rama fuente esperada pero no en la rama objetivo.
+#   6. Checks de propagación: por cada rama fuente esperada compara el
+#      contenido de los árboles (git diff) contra la rama objetivo. Esta
+#      comparación es inmune a squash merges porque mira el estado final
+#      de los archivos, no la historia de commits.
 #
 # El script ejecuta el checkout y el pull --ff-only por sí mismo. Los checks
 # de propagación son informativos: NO abortan el script (queda a criterio de
 # Claude mostrarlos y pedir confirmación al usuario).
+#
+# NOTA sobre squash merges: la comparación de propagación NO usa conteo de
+# commits por SHA. Cuando un merge a la rama objetivo se hace con squash, los
+# commits originales de la fuente conservan SHAs distintos y un conteo por SHA
+# los reportaría como "faltantes" aunque su contenido ya esté propagado. Por
+# eso se compara directamente el contenido de los árboles con git diff.
 #
 # Parámetros:
 #   -TargetBranch       Nombre de la rama objetivo (ej: "staging", "master").
@@ -66,7 +74,8 @@ function Emit-Result {
         $result.error = $Error
     }
 
-    # Depth 6 alcanza para la estructura más anidada (propagation[].missing_commits[].sha).
+    # Depth 6 alcanza de sobra para la estructura más anidada
+    # (propagation[].changed_files[]).
     $json = $result | ConvertTo-Json -Depth 6 -Compress:$false
     Write-Output $json
     exit ($(if ($Ok) { 0 } else { 1 }))
@@ -251,49 +260,58 @@ else {
 
 # ----------------------------------------------------------------------------
 # Paso 5: Checks de propagación
+#
+# Para cada rama fuente se compara el CONTENIDO del árbol contra la rama
+# objetivo con `git diff --name-only origin/<target> origin/<source>`.
+#
+# Esto lista los archivos cuyo contenido FINAL difiere entre las dos ramas.
+# Es la pregunta correcta: si un archivo que <source> modificó ya quedó
+# idéntico en <target> (porque el merge lo propagó — squash incluido), los
+# árboles coinciden en ese archivo y NO aparece. Inmune a squash merges,
+# porque mira el estado final de los archivos, no la historia de commits.
+#
+# No se usa conteo de commits por SHA: un squash le da SHAs nuevos a los
+# commits propagados, así que un conteo reportaría falsos positivos.
+#
+# No se aplica whitelist acá: el whitelist sirve para ignorar cambios LOCALES
+# sin commitear en el working directory. Esta comparación es entre dos ramas
+# remotas, donde no hay cambios locales; cualquier archivo que difiera es una
+# diferencia real de contenido que el usuario debe ver.
+#
+# Si la lista de archivos queda vacía -> no hay nada que propagar.
+# Si tiene archivos -> hay diferencia real de contenido: puede ser trabajo de
+# <source> sin propagar, o trabajo que <target> tiene y <source> no (ej:
+# hotfix de master). Ambos casos son relevantes, porque deployar <source>
+# sobrescribiría ese estado.
 # ----------------------------------------------------------------------------
 
 $propagation = @()
 foreach ($source in $ExpectedSources) {
-    # Commits que están en origin/<source> pero no en origin/<target>
-    $countResult = Invoke-Git -Args @("rev-list", "--count", "origin/$TargetBranch..origin/$source")
-    if ($countResult.ExitCode -ne 0) {
+    $diffResult = Invoke-Git -Args @("diff", "--name-only", "origin/$TargetBranch", "origin/$source")
+    if ($diffResult.ExitCode -ne 0) {
         Emit-Result -Ok $false `
             -WorkingDirectory $workingDirectory `
             -LocalSync $localSync `
             -Propagation @() `
-            -Error "No se pudo contar commits de origin/$source no propagados a origin/$($TargetBranch): $($countResult.Stderr.Trim())"
+            -Error "No se pudo comparar el contenido de origin/$source con origin/$($TargetBranch): $($diffResult.Stderr.Trim())"
     }
 
-    $missingCount = [int]($countResult.Stdout.Trim())
-    $missingCommits = @()
-
-    if ($missingCount -gt 0) {
-        # Traer hasta 10 commits con sha corto y subject
-        $logResult = Invoke-Git -Args @(
-            "log",
-            "origin/$TargetBranch..origin/$source",
-            "--pretty=format:%h%x09%s",
-            "-n", "10"
-        )
-        if ($logResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($logResult.Stdout)) {
-            $lines = $logResult.Stdout -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            foreach ($line in $lines) {
-                $parts = $line -split "`t", 2
-                if ($parts.Length -eq 2) {
-                    $missingCommits += @{
-                        sha     = $parts[0].Trim()
-                        message = $parts[1].Trim()
-                    }
-                }
+    $changedFiles = @()
+    if (-not [string]::IsNullOrWhiteSpace($diffResult.Stdout)) {
+        $diffLines = $diffResult.Stdout -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        foreach ($diffFile in $diffLines) {
+            $df = $diffFile.Trim()
+            if ($df.StartsWith('"') -and $df.EndsWith('"')) {
+                $df = $df.Substring(1, $df.Length - 2)
             }
+            $changedFiles += $df
         }
     }
 
     $propagation += @{
-        source          = $source
-        missing_count   = $missingCount
-        missing_commits = $missingCommits
+        source        = $source
+        has_changes   = ($changedFiles.Count -gt 0)
+        changed_files = $changedFiles
     }
 }
 

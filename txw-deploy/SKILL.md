@@ -118,17 +118,16 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
        "propagation": [
            {
                "source": "develop",
-               "missing_count": 3,
-               "missing_commits": [
-                   { "sha": "abc1234", "message": "feat: nuevo endpoint" },
-                   { "sha": "def5678", "message": "fix: validación" },
-                   { "sha": "ghi9012", "message": "chore: deps" }
+               "has_changes": true,
+               "changed_files": [
+                   "src/Controllers/UserController.cs",
+                   "src/Services/AuthService.cs"
                ]
            },
            {
                "source": "master",
-               "missing_count": 0,
-               "missing_commits": []
+               "has_changes": false,
+               "changed_files": []
            }
        ]
    }
@@ -138,27 +137,32 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
    - `working_directory.status`: `"clean"`, `"dirty"`, `"error"`.
    - `local_sync.status`: `"ok"` (al día), `"behind"` (estaba atrasado, ya hizo ff), `"ahead"` (bloqueante), `"diverged"` (bloqueante), `"error"`, `"not_checked"`.
 
+   **Cómo interpretar cada entrada de `propagation`:**
+
+   El check de propagación compara el **contenido** de cada rama fuente contra la rama objetivo con `git diff --name-only`. Esta comparación es inmune a squash merges: si un archivo que `develop` modificó ya quedó idéntico en `staging` (porque el merge lo propagó, sea normal o squasheado), no aparece como diferente. No se cuentan commits por SHA, porque un squash le da SHAs nuevos a los commits y eso generaría falsos positivos.
+
+   - `has_changes`: `true` si hay diferencia real de contenido entre la fuente y el target. **Esta es la señal que decide si hay algo sin propagar.**
+   - `changed_files`: lista de archivos cuyo contenido difiere entre las dos ramas. Puede ser trabajo de la fuente sin propagar, o trabajo que el target tiene y la fuente no (ej: un hotfix de `master`). Ambos casos importan, porque deployar la fuente sobrescribiría ese estado.
+
 4. **Manejo del resultado:**
 
    - Si `ok=false` (exit code 1): aborta el deploy. Mostrá al usuario el campo `error` y los detalles relevantes (archivos dirty, contadores ahead/behind, etc.) para que pueda corregir antes de reintentar.
 
-   - Si `ok=true` pero alguna entrada de `propagation` tiene `missing_count > 0`: **mostrá al usuario la lista de commits faltantes por cada fuente** y pedí confirmación explícita antes de seguir. Formato sugerido:
+   - Si `ok=true`: revisá cada entrada de `propagation` y decidí según **`has_changes`**:
 
-     > Detecté commits en ramas fuente que no están en `<target>`:
-     >
-     > **`develop`** — 3 commits sin propagar:
-     >   - abc1234 feat: nuevo endpoint
-     >   - def5678 fix: validación
-     >   - ghi9012 chore: deps
-     >
-     > **`master`** — 1 commit sin propagar:
-     >   - xyz9876 hotfix: corrección urgente en login
-     >
-     > Esto suele indicar que falta hacer un PR (de `develop` → `<target>` o `master` → `<target>` si es un hotfix). ¿Querés seguir con el deploy de todas formas?
+     - Si todas las fuentes tienen `has_changes = false` → no hay nada sin propagar. Seguí con el Paso 3 sin preguntar nada.
 
-     Si el usuario no responde afirmativamente de forma clara (`sí`, `seguir`, `s`, etc.), **abortá el deploy**. Default seguro: ante duda, no avanzar.
+     - Si alguna fuente tiene `has_changes = true` → hay diferencia real de contenido. **Mostrá al usuario los archivos afectados (`changed_files`)** y pedí confirmación explícita antes de seguir. Formato sugerido:
 
-   - Si `ok=true` y todas las propagaciones tienen `missing_count=0`: seguí con el Paso 3 sin preguntar nada.
+       > Detecté diferencias de contenido entre ramas fuente y `<target>`:
+       >
+       > **`develop`** — 2 archivos con cambios sin propagar:
+       >   - `src/Controllers/UserController.cs`
+       >   - `src/Services/AuthService.cs`
+       >
+       > Esto suele indicar que falta hacer un PR (de `develop` → `<target>`, o `master` → `<target>` si es un hotfix). ¿Querés seguir con el deploy de todas formas?
+
+       Si el usuario no responde afirmativamente de forma clara (`sí`, `seguir`, `s`, etc.), **abortá el deploy**. Default seguro: ante duda, no avanzar.
 
 ### Paso 3 — Resolver nombre de carpeta de deploy y del zip
 
@@ -302,7 +306,7 @@ Si `has_recipe=true`:
 - Si el check de readiness falla con `working_directory.status="dirty"` → aborta y pide al usuario que haga commit/stash primero.
 - Si el check de readiness falla con `local_sync.status="ahead"` → aborta y pide al usuario que haga `git push` antes de deployar.
 - Si el check de readiness falla con `local_sync.status="diverged"` → aborta y pide al usuario que resuelva el merge/rebase antes de deployar.
-- Si hay commits sin propagar (`propagation[].missing_count > 0`) y el usuario no confirma explícitamente → aborta.
+- Si hay diferencias de contenido sin propagar (`propagation[].has_changes = true`) y el usuario no confirma explícitamente → aborta.
 - Si `dotnet publish` falla → muestra la última parte del output y aborta.
 - Si falta el publish profile esperado → aborta indicando el path que esperaba.
 - Si la detección de migraciones no encuentra scripts pasados del ambiente → aborta e informa.
