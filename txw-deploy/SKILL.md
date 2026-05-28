@@ -15,12 +15,21 @@ Toda la configuración (rutas, nombres de proyecto, constantes de ambiente) est�
 
 **Antes de ejecutar cualquier otro paso**, identifica el path absoluto donde está instalada esta skill y guárdalo como `$SKILL_BASE`. Este path es necesario para invocar los scripts bundleados de forma confiable.
 
-Formas de obtenerlo, en orden de preferencia:
+En Windows, Claude Desktop suele instalarse como paquete UWP/MSIX (default de la Microsoft Store), por lo que el contenido de la skill queda virtualizado dentro del paquete y **no** vive en `~/.claude\skills\` ni en `~/.claude\plugins\`. Además, los UUIDs del marketplace y del plugin varían entre máquinas, así que no se pueden hardcodear. Resolvé `$SKILL_BASE` en runtime así:
 
-1. Si Claude Code te proporcionó el base path al cargar la skill, usalo.
-2. Si no, buscá la skill en ubicaciones conocidas (Windows):
-   - `C:\Users\<usuario>\.claude\skills\TXW-deploy\`
-   - `C:\Users\<usuario>\.claude\plugins\...\skills\TXW-deploy\` (si está instalada como plugin)
+1. **Descubrir la ruta del cache UWP en runtime.** Ejecutá este comando PowerShell, que busca recursivamente la carpeta `txw-deploy` bajo el cache del paquete:
+
+   ```powershell
+   Get-ChildItem "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\local-agent-mode-sessions\skills-plugin" `
+       -Recurse -Directory -Filter "txw-deploy" -ErrorAction SilentlyContinue `
+   | Select-Object -ExpandProperty FullName -First 1
+   ```
+
+   Si retorna un path, ese es `$SKILL_BASE`.
+
+2. **Fallbacks** (instalación no-UWP, o usuario que clonó el repo localmente). Si el comando anterior no retorna nada, probá en este orden y usá el primero que exista:
+   - `C:\Users\<usuario>\source\repos\skills\txw-deploy\`
+   - `$env:USERPROFILE\.claude\skills\txw-deploy\`
 
 Para todos los scripts que ejecutes, **siempre usá el path absoluto completo** `"$SKILL_BASE\scripts\<nombre>.ps1"` envuelto entre comillas dobles (por si el path tiene espacios). **Nunca uses rutas relativas** como `scripts/xxx.ps1` — Claude Code corre con CWD en el proyecto del usuario, no en la skill, por lo que los paths relativos fallan.
 
@@ -84,22 +93,22 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
    - `QA` → target: `staging`, expected_sources: `develop`, `master`
    - `PROD` → target: `master`, expected_sources: `staging`
 
-2. Ejecutá el script de readiness:
+2. Ejecutá el script de readiness. El script lee `target`, `expected_sources` y `git_status_whitelist` del propio `config.json` (evitamos pasar arrays como argumentos porque `pwsh -File` no los bindea bien):
 
    ```powershell
    pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\check_deploy_readiness.ps1" `
-       -TargetBranch "<target>" `
-       -ExpectedSources "<source1>","<source2>" `
-       -Whitelist "<whitelist_de_config>"
+       -ConfigPath "$SKILL_BASE\config.json" `
+       -Environment "<QA|PROD>"
    ```
 
    El script hace internamente, en este orden:
+   - Lee el config y resuelve target / expected_sources / whitelist según el environment.
    - Valida que el working directory esté limpio (ignora archivos del whitelist).
    - `git fetch` de la rama objetivo y todas las fuentes.
    - Si la rama objetivo no existe localmente, la crea desde `origin/<target>`.
    - `git checkout <target>`.
    - Calcula si la rama local está sincronizada con `origin/<target>`. Si está atrasada y limpia, hace `git pull --ff-only`. Si está adelantada o divergente, aborta.
-   - Cuenta y lista los commits de cada `expected_source` que no estén en `origin/<target>` (hasta 10 por fuente).
+   - Para cada `expected_source`, compara el contenido contra `origin/<target>` (bidireccional, inmune a squash) y clasifica los archivos que difieren según en qué rama tienen el commit más reciente.
 
 3. Salida JSON del script:
 
@@ -122,12 +131,16 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
                "changed_files": [
                    "src/Controllers/UserController.cs",
                    "src/Services/AuthService.cs"
-               ]
+               ],
+               "target_ahead_files": []
            },
            {
                "source": "master",
                "has_changes": false,
-               "changed_files": []
+               "changed_files": [],
+               "target_ahead_files": [
+                   "src/Hotfix/SomeFile.cs"
+               ]
            }
        ]
    }
@@ -139,10 +152,11 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
 
    **Cómo interpretar cada entrada de `propagation`:**
 
-   El check de propagación compara el **contenido** de cada rama fuente contra la rama objetivo con `git diff --name-only`. Esta comparación es inmune a squash merges: si un archivo que `develop` modificó ya quedó idéntico en `staging` (porque el merge lo propagó, sea normal o squasheado), no aparece como diferente. No se cuentan commits por SHA, porque un squash le da SHAs nuevos a los commits y eso generaría falsos positivos.
+   El check compara el contenido entre `origin/<source>` y `origin/<target>` con `git diff --name-only` (bidireccional, inmune a squash merges). De los archivos que difieren, clasifica según en qué rama está el último commit que los tocó (committer time):
 
-   - `has_changes`: `true` si hay diferencia real de contenido entre la fuente y el target. **Esta es la señal que decide si hay algo sin propagar.**
-   - `changed_files`: lista de archivos cuyo contenido difiere entre las dos ramas. Puede ser trabajo de la fuente sin propagar, o trabajo que el target tiene y la fuente no (ej: un hotfix de `master`). Ambos casos importan, porque deployar la fuente sobrescribiría ese estado.
+   - **`changed_files`**: archivos modificados más recientemente en `<source>` que en `<target>`. Es decir, trabajo de la fuente que **falta propagar** al target. Esta es la única lista que debe disparar alerta.
+   - **`target_ahead_files`**: archivos modificados más recientemente en `<target>` que en `<source>`. Es el caso normal de gitflow (ej: un hotfix en `master` que ya está propagado a `staging` pero `develop` aún no lo recibió). **No es motivo de alerta**; se incluye solo como información.
+   - **`has_changes`**: depende **solo** de `changed_files`. Si está vacío, `has_changes=false` aunque haya cosas en `target_ahead_files`.
 
 4. **Manejo del resultado:**
 
@@ -152,17 +166,19 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
 
      - Si todas las fuentes tienen `has_changes = false` → no hay nada sin propagar. Seguí con el Paso 3 sin preguntar nada.
 
-     - Si alguna fuente tiene `has_changes = true` → hay diferencia real de contenido. **Mostrá al usuario los archivos afectados (`changed_files`)** y pedí confirmación explícita antes de seguir. Formato sugerido:
+     - Si alguna fuente tiene `has_changes = true` → hay trabajo en la fuente que no está propagado al target. **Mostrá al usuario los archivos afectados (`changed_files`)** y pedí confirmación explícita antes de seguir. Formato sugerido:
 
-       > Detecté diferencias de contenido entre ramas fuente y `<target>`:
+       > Detecté cambios en ramas fuente que aún no están propagados a `<target>`:
        >
-       > **`develop`** — 2 archivos con cambios sin propagar:
+       > **`develop`** — 2 archivos sin propagar:
        >   - `src/Controllers/UserController.cs`
        >   - `src/Services/AuthService.cs`
        >
-       > Esto suele indicar que falta hacer un PR (de `develop` → `<target>`, o `master` → `<target>` si es un hotfix). ¿Querés seguir con el deploy de todas formas?
+       > Esto suele indicar que falta hacer un PR de `develop` → `<target>`. ¿Querés seguir con el deploy de todas formas?
 
        Si el usuario no responde afirmativamente de forma clara (`sí`, `seguir`, `s`, etc.), **abortá el deploy**. Default seguro: ante duda, no avanzar.
+
+       Los archivos en `target_ahead_files` NO se muestran ni disparan alerta: son el caso normal de gitflow.
 
 ### Paso 3 — Resolver nombre de carpeta de deploy y del zip
 
@@ -306,7 +322,7 @@ Si `has_recipe=true`:
 - Si el check de readiness falla con `working_directory.status="dirty"` → aborta y pide al usuario que haga commit/stash primero.
 - Si el check de readiness falla con `local_sync.status="ahead"` → aborta y pide al usuario que haga `git push` antes de deployar.
 - Si el check de readiness falla con `local_sync.status="diverged"` → aborta y pide al usuario que resuelva el merge/rebase antes de deployar.
-- Si hay diferencias de contenido sin propagar (`propagation[].has_changes = true`) y el usuario no confirma explícitamente → aborta.
+- Si hay cambios sin propagar (`propagation[].has_changes = true`, es decir, archivos en `changed_files`) y el usuario no confirma explícitamente → aborta.
 - Si `dotnet publish` falla → muestra la última parte del output y aborta.
 - Si falta el publish profile esperado → aborta indicando el path que esperaba.
 - Si la detección de migraciones no encuentra scripts pasados del ambiente → aborta e informa.
