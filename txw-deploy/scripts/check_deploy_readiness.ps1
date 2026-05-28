@@ -9,9 +9,14 @@
 #      - Si está atrasado y limpio: avanza con fast-forward.
 #      - Si está adelantado o divergente: aborta con error.
 #   6. Checks de propagación: por cada rama fuente esperada compara el
-#      contenido de los árboles (git diff) contra la rama objetivo. Esta
-#      comparación es inmune a squash merges porque mira el estado final
-#      de los archivos, no la historia de commits.
+#      contenido de los árboles (git diff) contra la rama objetivo. La
+#      comparación es bidireccional (inmune a squash merges porque mira
+#      el estado final de los archivos, no la historia de commits) y
+#      después clasifica cada archivo en dos buckets según en qué rama
+#      está la versión más reciente:
+#        - source más nuevo  -> falta propagar (alerta)
+#        - target más nuevo  -> normal en gitflow (no alerta)
+#      Solo el primer bucket dispara la confirmación al usuario.
 #
 # El script ejecuta el checkout y el pull --ff-only por sí mismo. Los checks
 # de propagación son informativos: NO abortan el script (queda a criterio de
@@ -21,32 +26,31 @@
 # commits por SHA. Cuando un merge a la rama objetivo se hace con squash, los
 # commits originales de la fuente conservan SHAs distintos y un conteo por SHA
 # los reportaría como "faltantes" aunque su contenido ya esté propagado. Por
-# eso se compara directamente el contenido de los árboles con git diff.
+# eso se compara directamente el contenido de los árboles con git diff y
+# luego se clasifica por timestamp del último commit por archivo en cada rama.
 #
 # Parámetros:
-#   -TargetBranch       Nombre de la rama objetivo (ej: "staging", "master").
-#   -ExpectedSources    Array de nombres de ramas que deberían estar propagadas
-#                       en la rama objetivo (ej: "develop","master" para QA;
-#                       "staging" para PROD).
-#   -Whitelist          Array de nombres de archivo cuyos cambios sin commitear
-#                       se permiten (típicamente "appsettings.Development.json").
+#   -ConfigPath   Ruta absoluta al config.json de la skill. El script lee de
+#                 ahí target, expected_sources y git_status_whitelist según
+#                 el environment, evitando pasar arrays como argumentos
+#                 (que no se bindean bien con pwsh -File).
+#   -Environment  "QA" o "PROD". Se usa para resolver branches[<Environment>]
+#                 en el config.
 #
 # Salida: JSON con la estructura documentada en SKILL.md.
 # Exit code:
 #   0  - ok=true. Repo en condiciones de deployar. Puede haber propagación
 #        pendiente (Claude decide qué hacer con eso).
 #   1  - ok=false. Algún problema bloqueante: working dir dirty, rama divergente,
-#        commits locales sin pushear, o error de git.
+#        commits locales sin pushear, o error de git/config.
 
 param(
     [Parameter(Mandatory = $true)]
-    [string]$TargetBranch,
+    [string]$ConfigPath,
 
     [Parameter(Mandatory = $true)]
-    [string[]]$ExpectedSources,
-
-    [Parameter(Mandatory = $false)]
-    [string[]]$Whitelist = @()
+    [ValidateSet("QA", "PROD")]
+    [string]$Environment
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,7 +65,7 @@ function Emit-Result {
         [hashtable]$WorkingDirectory,
         [hashtable]$LocalSync,
         [array]$Propagation,
-        [string]$Error = $null
+        [string]$ErrorMessage = $null
     )
 
     $result = @{
@@ -70,8 +74,8 @@ function Emit-Result {
         local_sync        = $LocalSync
         propagation       = $Propagation
     }
-    if ($Error) {
-        $result.error = $Error
+    if ($ErrorMessage) {
+        $result.error = $ErrorMessage
     }
 
     # Depth 6 alcanza de sobra para la estructura más anidada
@@ -87,7 +91,7 @@ function Invoke-Git {
     # Usa Start-Process redirigiendo a archivos temporales.
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$Args
+        [string[]]$Arguments
     )
 
     $stdoutFile = [System.IO.Path]::GetTempFileName()
@@ -95,7 +99,7 @@ function Invoke-Git {
 
     try {
         $proc = Start-Process -FilePath "git" `
-            -ArgumentList $Args `
+            -ArgumentList $Arguments `
             -NoNewWindow `
             -Wait `
             -PassThru `
@@ -118,16 +122,60 @@ function Invoke-Git {
 }
 
 # ----------------------------------------------------------------------------
+# Paso 0: Leer config y resolver target / expected_sources / whitelist
+# ----------------------------------------------------------------------------
+
+if (-not (Test-Path $ConfigPath)) {
+    Emit-Result -Ok $false `
+        -WorkingDirectory @{ status = "error"; files = @() } `
+        -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
+        -Propagation @() `
+        -ErrorMessage "No se encontró el config.json en '$ConfigPath'."
+}
+
+try {
+    $config = Get-Content $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+}
+catch {
+    Emit-Result -Ok $false `
+        -WorkingDirectory @{ status = "error"; files = @() } `
+        -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
+        -Propagation @() `
+        -ErrorMessage "No se pudo parsear config.json: $($_.Exception.Message)"
+}
+
+$branchConfig = $config.branches.$Environment
+if (-not $branchConfig) {
+    Emit-Result -Ok $false `
+        -WorkingDirectory @{ status = "error"; files = @() } `
+        -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
+        -Propagation @() `
+        -ErrorMessage "config.branches.$Environment no existe en el config.json."
+}
+
+$TargetBranch = [string]$branchConfig.target
+$ExpectedSources = @($branchConfig.expected_sources)
+$Whitelist = if ($config.git_status_whitelist) { @($config.git_status_whitelist) } else { @() }
+
+if (-not $TargetBranch) {
+    Emit-Result -Ok $false `
+        -WorkingDirectory @{ status = "error"; files = @() } `
+        -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
+        -Propagation @() `
+        -ErrorMessage "config.branches.$Environment.target está vacío."
+}
+
+# ----------------------------------------------------------------------------
 # Paso 1: Working directory limpio (ignora whitelist)
 # ----------------------------------------------------------------------------
 
-$statusResult = Invoke-Git -Args @("status", "--porcelain")
+$statusResult = Invoke-Git -Arguments @("status", "--porcelain")
 if ($statusResult.ExitCode -ne 0) {
     Emit-Result -Ok $false `
         -WorkingDirectory @{ status = "error"; files = @() } `
         -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
         -Propagation @() `
-        -Error "git status falló: $($statusResult.Stderr.Trim())"
+        -ErrorMessage "git status falló: $($statusResult.Stderr.Trim())"
 }
 
 $dirtyFiles = @()
@@ -158,7 +206,7 @@ if ($dirtyFiles.Count -gt 0) {
         -WorkingDirectory @{ status = "dirty"; files = $dirtyFiles } `
         -LocalSync @{ status = "not_checked"; ahead_count = 0; behind_count = 0 } `
         -Propagation @() `
-        -Error "Hay archivos modificados sin commitear (fuera del whitelist). Hacé commit o stash antes de seguir."
+        -ErrorMessage "Hay archivos modificados sin commitear (fuera del whitelist). Hacé commit o stash antes de seguir."
 }
 
 $workingDirectory = @{ status = "clean"; files = @() }
@@ -169,39 +217,39 @@ $workingDirectory = @{ status = "clean"; files = @() }
 
 $branchesToFetch = @($TargetBranch) + $ExpectedSources | Select-Object -Unique
 $fetchArgs = @("fetch", "origin") + $branchesToFetch + @("--quiet")
-$fetchResult = Invoke-Git -Args $fetchArgs
+$fetchResult = Invoke-Git -Arguments $fetchArgs
 if ($fetchResult.ExitCode -ne 0) {
     Emit-Result -Ok $false `
         -WorkingDirectory $workingDirectory `
         -LocalSync @{ status = "error"; ahead_count = 0; behind_count = 0 } `
         -Propagation @() `
-        -Error "git fetch falló: $($fetchResult.Stderr.Trim())"
+        -ErrorMessage "git fetch falló: $($fetchResult.Stderr.Trim())"
 }
 
 # ----------------------------------------------------------------------------
 # Paso 3: Asegurar que la rama objetivo existe localmente y hacer checkout
 # ----------------------------------------------------------------------------
 
-$branchExistsResult = Invoke-Git -Args @("show-ref", "--verify", "--quiet", "refs/heads/$TargetBranch")
+$branchExistsResult = Invoke-Git -Arguments @("show-ref", "--verify", "--quiet", "refs/heads/$TargetBranch")
 if ($branchExistsResult.ExitCode -ne 0) {
     # No existe localmente: crearla trackeando origin/<target>
-    $createResult = Invoke-Git -Args @("checkout", "-b", $TargetBranch, "origin/$TargetBranch")
+    $createResult = Invoke-Git -Arguments @("checkout", "-b", $TargetBranch, "origin/$TargetBranch")
     if ($createResult.ExitCode -ne 0) {
         Emit-Result -Ok $false `
             -WorkingDirectory $workingDirectory `
             -LocalSync @{ status = "error"; ahead_count = 0; behind_count = 0 } `
             -Propagation @() `
-            -Error "No se pudo crear la rama local '$TargetBranch' desde origin/$($TargetBranch): $($createResult.Stderr.Trim())"
+            -ErrorMessage "No se pudo crear la rama local '$TargetBranch' desde origin/$($TargetBranch): $($createResult.Stderr.Trim())"
     }
 }
 else {
-    $checkoutResult = Invoke-Git -Args @("checkout", $TargetBranch)
+    $checkoutResult = Invoke-Git -Arguments @("checkout", $TargetBranch)
     if ($checkoutResult.ExitCode -ne 0) {
         Emit-Result -Ok $false `
             -WorkingDirectory $workingDirectory `
             -LocalSync @{ status = "error"; ahead_count = 0; behind_count = 0 } `
             -Propagation @() `
-            -Error "git checkout $TargetBranch falló: $($checkoutResult.Stderr.Trim())"
+            -ErrorMessage "git checkout $TargetBranch falló: $($checkoutResult.Stderr.Trim())"
     }
 }
 
@@ -209,15 +257,15 @@ else {
 # Paso 4: Calcular sincronización local antes de pull
 # ----------------------------------------------------------------------------
 
-$aheadResult = Invoke-Git -Args @("rev-list", "--count", "origin/$TargetBranch..HEAD")
-$behindResult = Invoke-Git -Args @("rev-list", "--count", "HEAD..origin/$TargetBranch")
+$aheadResult = Invoke-Git -Arguments @("rev-list", "--count", "origin/$TargetBranch..HEAD")
+$behindResult = Invoke-Git -Arguments @("rev-list", "--count", "HEAD..origin/$TargetBranch")
 
 if ($aheadResult.ExitCode -ne 0 -or $behindResult.ExitCode -ne 0) {
     Emit-Result -Ok $false `
         -WorkingDirectory $workingDirectory `
         -LocalSync @{ status = "error"; ahead_count = 0; behind_count = 0 } `
         -Propagation @() `
-        -Error "No se pudo calcular el estado de sincronización local."
+        -ErrorMessage "No se pudo calcular el estado de sincronización local."
 }
 
 $ahead = [int]($aheadResult.Stdout.Trim())
@@ -229,7 +277,7 @@ if ($ahead -gt 0 -and $behind -eq 0) {
         -WorkingDirectory $workingDirectory `
         -LocalSync @{ status = "ahead"; ahead_count = $ahead; behind_count = 0 } `
         -Propagation @() `
-        -Error "La rama local '$TargetBranch' tiene $ahead commit(s) que no están en origin/$TargetBranch. Hacé git push antes de deployar."
+        -ErrorMessage "La rama local '$TargetBranch' tiene $ahead commit(s) que no están en origin/$TargetBranch. Hacé git push antes de deployar."
 }
 
 # Caso 2: divergente -> abortar
@@ -238,18 +286,18 @@ if ($ahead -gt 0 -and $behind -gt 0) {
         -WorkingDirectory $workingDirectory `
         -LocalSync @{ status = "diverged"; ahead_count = $ahead; behind_count = $behind } `
         -Propagation @() `
-        -Error "La rama local '$TargetBranch' divergió de origin/$TargetBranch ($ahead local, $behind remoto). Resolvé el merge/rebase antes de deployar."
+        -ErrorMessage "La rama local '$TargetBranch' divergió de origin/$TargetBranch ($ahead local, $behind remoto). Resolvé el merge/rebase antes de deployar."
 }
 
 # Caso 3: atrasado y limpio -> pull --ff-only
 if ($behind -gt 0) {
-    $pullResult = Invoke-Git -Args @("pull", "--ff-only", "origin", $TargetBranch)
+    $pullResult = Invoke-Git -Arguments @("pull", "--ff-only", "origin", $TargetBranch)
     if ($pullResult.ExitCode -ne 0) {
         Emit-Result -Ok $false `
             -WorkingDirectory $workingDirectory `
             -LocalSync @{ status = "error"; ahead_count = 0; behind_count = $behind } `
             -Propagation @() `
-            -Error "git pull --ff-only falló: $($pullResult.Stderr.Trim())"
+            -ErrorMessage "git pull --ff-only falló: $($pullResult.Stderr.Trim())"
     }
     $localSync = @{ status = "behind"; ahead_count = 0; behind_count = $behind }
 }
@@ -259,44 +307,44 @@ else {
 }
 
 # ----------------------------------------------------------------------------
-# Paso 5: Checks de propagación
+# Paso 5: Checks de propagación (bidireccional con clasificación por timestamp)
 #
-# Para cada rama fuente se compara el CONTENIDO del árbol contra la rama
-# objetivo con `git diff --name-only origin/<target> origin/<source>`.
+# Se compara el CONTENIDO del árbol con `git diff --name-only origin/<target>
+# origin/<source>`. Esto es inmune a squash merges porque mira el estado final
+# de los archivos. Después, para cada archivo que difiere, se clasifica según
+# en qué rama está el último commit que lo tocó (mediante committer time):
 #
-# Esto lista los archivos cuyo contenido FINAL difiere entre las dos ramas.
-# Es la pregunta correcta: si un archivo que <source> modificó ya quedó
-# idéntico en <target> (porque el merge lo propagó — squash incluido), los
-# árboles coinciden en ese archivo y NO aparece. Inmune a squash merges,
-# porque mira el estado final de los archivos, no la historia de commits.
+#   - sourceTime > targetTime  -> el archivo se modificó más recientemente en
+#                                 <source> que en <target>: falta propagar.
+#                                 Aparece en changed_files y dispara has_changes.
 #
-# No se usa conteo de commits por SHA: un squash le da SHAs nuevos a los
-# commits propagados, así que un conteo reportaría falsos positivos.
+#   - targetTime >= sourceTime -> el archivo está más "fresco" en <target>.
+#                                 Caso normal en gitflow (ej: hotfix de master
+#                                 propagado a staging que aún no llegó a
+#                                 develop). NO dispara alerta; se reporta
+#                                 aparte en target_ahead_files como info.
+#
+# Esto elimina los falsos positivos que aparecían cuando el diff bidireccional
+# detectaba diferencias "del lado de target" en escenarios esperados del flujo.
 #
 # No se aplica whitelist acá: el whitelist sirve para ignorar cambios LOCALES
 # sin commitear en el working directory. Esta comparación es entre dos ramas
 # remotas, donde no hay cambios locales; cualquier archivo que difiera es una
-# diferencia real de contenido que el usuario debe ver.
-#
-# Si la lista de archivos queda vacía -> no hay nada que propagar.
-# Si tiene archivos -> hay diferencia real de contenido: puede ser trabajo de
-# <source> sin propagar, o trabajo que <target> tiene y <source> no (ej:
-# hotfix de master). Ambos casos son relevantes, porque deployar <source>
-# sobrescribiría ese estado.
+# diferencia real de contenido.
 # ----------------------------------------------------------------------------
 
 $propagation = @()
 foreach ($source in $ExpectedSources) {
-    $diffResult = Invoke-Git -Args @("diff", "--name-only", "origin/$TargetBranch", "origin/$source")
+    $diffResult = Invoke-Git -Arguments @("diff", "--name-only", "origin/$TargetBranch", "origin/$source")
     if ($diffResult.ExitCode -ne 0) {
         Emit-Result -Ok $false `
             -WorkingDirectory $workingDirectory `
             -LocalSync $localSync `
             -Propagation @() `
-            -Error "No se pudo comparar el contenido de origin/$source con origin/$($TargetBranch): $($diffResult.Stderr.Trim())"
+            -ErrorMessage "No se pudo comparar el contenido de origin/$source con origin/$($TargetBranch): $($diffResult.Stderr.Trim())"
     }
 
-    $changedFiles = @()
+    $allDifferingFiles = @()
     if (-not [string]::IsNullOrWhiteSpace($diffResult.Stdout)) {
         $diffLines = $diffResult.Stdout -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         foreach ($diffFile in $diffLines) {
@@ -304,14 +352,40 @@ foreach ($source in $ExpectedSources) {
             if ($df.StartsWith('"') -and $df.EndsWith('"')) {
                 $df = $df.Substring(1, $df.Length - 2)
             }
-            $changedFiles += $df
+            $allDifferingFiles += $df
+        }
+    }
+
+    # Clasificar cada archivo por timestamp del último commit en cada rama.
+    $sourceAheadFiles = @()
+    $targetAheadFiles = @()
+
+    foreach ($file in $allDifferingFiles) {
+        $sourceTimeResult = Invoke-Git -Arguments @("log", "-1", "--format=%ct", "origin/$source", "--", $file)
+        $targetTimeResult = Invoke-Git -Arguments @("log", "-1", "--format=%ct", "origin/$TargetBranch", "--", $file)
+
+        $sourceTime = 0
+        $targetTime = 0
+        if ($sourceTimeResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($sourceTimeResult.Stdout)) {
+            $sourceTime = [long]($sourceTimeResult.Stdout.Trim())
+        }
+        if ($targetTimeResult.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($targetTimeResult.Stdout)) {
+            $targetTime = [long]($targetTimeResult.Stdout.Trim())
+        }
+
+        if ($sourceTime -gt $targetTime) {
+            $sourceAheadFiles += $file
+        }
+        else {
+            $targetAheadFiles += $file
         }
     }
 
     $propagation += @{
-        source        = $source
-        has_changes   = ($changedFiles.Count -gt 0)
-        changed_files = $changedFiles
+        source             = $source
+        has_changes        = ($sourceAheadFiles.Count -gt 0)
+        changed_files      = $sourceAheadFiles
+        target_ahead_files = $targetAheadFiles
     }
 }
 
