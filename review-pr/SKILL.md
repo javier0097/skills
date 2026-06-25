@@ -232,6 +232,64 @@ Reglas de formato:
 - Si el check completo no tiene hallazgos, la sección **Comentarios innecesarios** no aparece en el reporte.
 - Una nota breve al final de cada entrada (tras `—`) solo cuando ayuda a entender por qué se marcó; si la categoría ya lo deja claro, se omite la nota.
 
+### Check: Acceso a datos en la capa de aplicación
+
+**Principio:** el acceso a datos debe estar **encapsulado en la capa de datos**,
+nunca disperso por la aplicación. Ningún componente fuera de esa capa
+(servicios, controllers, filtros, helpers) debe conocer ni tocar el ORM
+directamente — su único punto de entrada a los datos es `IUnitOfWork`. Esto
+mantiene la lógica de persistencia en un solo lugar, testeable y reemplazable.
+
+Concretamente: el `CoreDbContext`, los `DbSet<>` y `SaveChanges` viven
+exclusivamente en la capa de datos; los servicios dependen solo de
+`IUnitOfWork` inyectado por constructor.
+
+**Solo aplica a archivos `.cs`.**
+
+#### Determinar la capa del archivo
+
+Un archivo pertenece a la **capa de datos** (uso legítimo, se ignora) si su
+ruta/nombre cumple alguna señal:
+- la ruta contiene `/Data/`
+- la ruta contiene `/Repositories/` o el archivo termina en `Repository.cs`
+- el archivo es `UnitOfWork.cs` o termina en `DbContext.cs`
+
+Cualquier otro `.cs` (servicios, controllers, filtros, helpers) es **capa de
+aplicación**: ahí los primitivos de acceso a datos se reportan.
+
+#### Señales que se reportan (capa de aplicación)
+
+| Categoría | Patrón | Sugerencia |
+|---|---|---|
+| `dbcontext-dependency` | un tipo `*DbContext` como parámetro de constructor o campo | Inyectar `IUnitOfWork` en su lugar |
+| `dbset-usage` | `DbSet<…>` | Acceder vía el repositorio del UoW |
+| `savechanges` | `.SaveChanges(...)` / `.SaveChangesAsync(...)` | Persistir con `_unitOfWork.Save()` |
+
+#### Qué NO se reporta (legítimo)
+
+- `using Microsoft.EntityFrameworkCore;` por sí solo.
+- `.Include(...)` / `.ThenInclude(...)`: los servicios arman include-expressions
+  que le pasan al repositorio; es el patrón correcto.
+- Cualquier acceso a través de `_unitOfWork` o un repositorio. En particular
+  `_unitOfWork.Save()` es lo correcto — **no** confundir con `.SaveChanges()`.
+
+#### Formato en el reporte
+
+El check produce una sección titulada **Acceso a datos en la capa de
+aplicación**. Por cada violación se lista la ubicación (`archivo:línea`), el
+fragmento ofensor y una sugerencia. Ejemplo de salida:
+```
+### Acceso a datos en la capa de aplicación
+
+**dbcontext-dependency**
+- Modules/Truextend.Core/Services/ApplicantService.cs:13 — `CoreDbContext context` en el constructor → inyectar `IUnitOfWork`
+
+**savechanges**
+- Modules/Truextend.Core/Services/ApplicantService.cs:34 — `.SaveChanges()` → usar `_unitOfWork.Save()`
+```
+
+Si el check no encuentra hallazgos, la sección completa se omite del reporte.
+
 ## Manejo de errores
 
 - Si el PR ID no es un número válido, pide al usuario que verifique.
