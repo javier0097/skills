@@ -387,6 +387,54 @@ Ejemplo:
 ```
 
 Si no hay hallazgos, la sección se omite.
+
+### Check: Un tipo público por archivo
+
+**Principio:** cada tipo público debe vivir en su **propio archivo, nombrado
+igual que el tipo**. Es la convención estándar de .NET (StyleCop `SA1402` /
+`SA1649`): descubribilidad por nombre, diffs e historial limpios, y una sola
+razón de cambio por archivo. Aplica a **todo el código C#**, no solo a
+DTOs/ViewModels — aunque ahí es donde más se viola y menos se justifica.
+
+**Alcance:** archivos `.cs`, salvo autogenerados (migraciones, `*.Designer.cs`),
+ya excluidos por el skip global del Paso 4. Disparado por el diff: solo se
+evalúan archivos que el PR agregó o modificó.
+
+#### Qué se reporta
+
+Todo archivo que declara **más de un tipo público de primer nivel** (`class`,
+`record`, `struct`, `interface`, `enum`).
+
+#### Excepciones
+
+Por ahora **no hay excepciones más allá de los autogenerados**. La lista crecerá
+a mano a medida que aparezcan casos legítimos (ver más abajo).
+
+<!-- Excepciones aprobadas (agregar aquí a medida que se confirmen):
+     - (vacío)
+-->
+
+#### Candidatas a excepción (avisar, no silenciar)
+
+Algunas agrupaciones suelen ser legítimas. El check **igual las reporta**, pero
+marca la entrada como **candidata a excepción** para que el usuario evalúe
+agregarla a la lista de arriba. 
+
+#### Formato en el reporte
+
+Sección **Un tipo por archivo**, una entrada por archivo con los tipos que
+declara y, si aplica, la marca de candidata a excepción. Ejemplo:
+
+```
+### Un tipo por archivo
+
+- DTOs/ApplicantDtos.cs declara 4 tipos públicos: ApplicantRegisterRequestDto, ApplicantLoginRequestDto, ApplicantProfileResponseDto, ApplicantApplicationResponseDto → separar uno por archivo
+- Common/Result.cs declara 2 tipos públicos: Result, Result<T> ← posible excepción: variante genérica del mismo tipo
+- Services/NotificationService.cs declara 2 tipos públicos: NotificationService, NotificationLevel(enum) ← posible excepción: enum acompañante acoplado
+```
+
+Si no hay hallazgos, la sección se omite.
+
 ## Manejo de errores
 
 - Si el PR ID no es un número válido, pide al usuario que verifique.
