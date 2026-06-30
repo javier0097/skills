@@ -290,6 +290,103 @@ fragmento ofensor y una sugerencia. Ejemplo de salida:
 
 Si el check no encuentra hallazgos, la sección completa se omite del reporte.
 
+### Check: Duplicación de modelos
+
+**Principio:** antes de crear un modelo (entidad) nuevo o ampliar uno existente,
+verificar que no se esté **recreando un dato que ya vive en otro modelo**. El
+foco es estructural, no de validación fina: *¿hace falta este modelo, completa o
+parcialmente, o se está duplicando uno que ya existe?* La duplicación se evalúa
+por **concepto, no por nombre exacto** — dos propiedades pueden representar el
+mismo dato con nombres distintos (`LinkedInProfile` vs `LinkedInUrl`).
+
+**Solo aplica a archivos `.cs` en `/Models/`.** Se dispara cuando el PR agrega un
+modelo nuevo o agrega propiedades a uno existente. Para comparar, lee los
+modelos completos (la contraparte puede ser preexistente).
+
+#### Cómo razona
+
+- Toma las propiedades de dominio del modelo nuevo/modificado.
+- Las compara contra las de los demás modelos buscando las que representen el
+  **mismo concepto**: mismo nombre, o nombre similar (stem compartido) con tipo
+  compatible. Aplica juicio para confirmar que es el mismo concepto antes de
+  contarlo.
+- Reporta el solapamiento si el modelo comparte **≥3 propiedades de dominio** o
+  **≥50% de las suyas** con otro modelo (lo que se cumpla primero).
+- No afirma "borrá el modelo" (puede tener razón de existir): plantea la pregunta
+  de necesidad sobre los campos duplicados.
+
+**Se ignoran** (ruido infraestructural): `Id`, claves foráneas (`*Id`),
+propiedades de navegación, colecciones, y timestamps de auditoría (`CreatedAt`,
+`UpdatedAt`, `LastUpdate`).
+
+#### Formato en el reporte
+
+Sección **Duplicación de modelos**. Por cada modelo con solapamiento, el modelo
+contraparte, la lista de propiedades compartidas y la pregunta de necesidad.
+Ejemplo:
+
+```
+### Duplicación de modelos
+
+**Applicant** comparte 8 propiedades de dominio con **CandidateRequest**:
+FullName, Email, PhonePrefix, PhoneNumber, LinkedInProfile, City, Country, Address
+→ Evaluar si estos campos deben vivir en Applicant o si duplican datos de CandidateRequest.
+```
+
+Si no hay hallazgos, la sección se omite.
+
+### Check: Consistencia modelo ↔ representación (DTO/ViewModel)
+
+**Principio:** una propiedad de un DTO o ViewModel que **representa** una
+propiedad de un modelo debe tener el **mismo nombre** y, **si declara
+validaciones, las mismas validaciones**. No se exige que el DTO/VM valide: una
+propiedad sin atributos es válida y no se reporta. Pero si valida, su validación
+no puede divergir de la del modelo (ni más laxa, ni más estricta, ni renombrar
+el concepto).
+
+**Alcance:** modelos (`/Models/`) ↔ DTOs (`*Dto.cs`, `/DTOs/`) y ViewModels
+(`*ViewModel.cs`, `/ViewModels/`). Disparado por el diff; lee los archivos
+completos de ambos lados (la contraparte puede ser preexistente).
+
+#### Cómo establece la correspondencia
+
+- **`divergent-validation`**: propiedad homónima entre modelo y DTO/VM, o
+  propiedades conectadas por un mapeo explícito.
+- **`inconsistent-name`**: requiere **mapeo explícito** (AutoMapper
+  `CreateMap<…>` o método de mapeo manual) que conecte dos propiedades de
+  **nombre distinto**.
+
+Antes de reportar, confirma por juicio que ambas propiedades representan el mismo
+concepto (mismo tipo, concepto plausible). **No** marca colisiones casuales de
+nombre (p. ej. un `Email` de filtro de búsqueda que no espeja la entidad).
+
+#### Categorías que se reportan
+
+| Categoría | Qué detecta |
+|---|---|
+| `divergent-validation` | la propiedad del DTO/VM **declara validaciones** que difieren de las del modelo (`[MaxLength]`, `[Required]`, `[EmailAddress]`, `[Url]`, `[Range]`…). Si el DTO/VM no declara validaciones para esa propiedad, no se reporta. |
+| `inconsistent-name` | el mapeo conecta `Modelo.X` con `Dto.Y` de nombre distinto |
+
+**Se ignoran** las mismas propiedades infraestructurales que en el check anterior
+(`Id`, FKs, navegaciones, colecciones, auditoría).
+
+#### Formato en el reporte
+
+Sección **Consistencia modelo ↔ representación**, agrupada por categoría.
+Ejemplo:
+
+```
+### Consistencia modelo ↔ representación
+
+**divergent-validation**
+- FullName — CandidateRequest: `MaxLength(250)` vs ApplicantProfileUpdateRequestDto / ApplicantRegisterRequestDto: `MaxLength(150)`
+- Email — CandidateRequest: `[EmailAddress][MaxLength(250)]` vs ApplicantRegisterRequestDto: `[Required][EmailAddress][MaxLength(150)]`
+
+**inconsistent-name**
+- CandidateRequest.LinkedInProfile ↔ ApplicantProfileUpdateRequestDto.LinkedInUrl (conectadas por el mapper)
+```
+
+Si no hay hallazgos, la sección se omite.
 ## Manejo de errores
 
 - Si el PR ID no es un número válido, pide al usuario que verifique.
