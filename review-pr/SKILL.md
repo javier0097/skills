@@ -414,6 +414,59 @@ declara y el arreglo sugerido. Ejemplo:
 
 Si no hay hallazgos, la sección se omite.
 
+### Check: Mapeo manual pudiendo usar el mapper
+
+**Principio:** la conversión entre objetos (modelo ↔ DTO/ViewModel) se centraliza
+en AutoMapper (`MappingProfile` + `IMapper`), no se escribe a mano. El mapeo
+manual dispersa la lógica de conversión, se **desincroniza** al agregar
+propiedades (se suma un campo al DTO y el copiado manual lo olvida), y duplica lo
+que el mapper ya resuelve.
+
+**Alcance:** archivos `.cs`, líneas añadidas/modificadas. Aplica en todo el
+proyecto: `IMapper`/AutoMapper está disponible globalmente.
+
+#### Qué se reporta
+
+Mapeo manual objeto-a-objeto que el mapper debería cubrir, cuando copia **3 o
+más** miembros desde un mismo objeto fuente de otro tipo (modelo/DTO/VM):
+
+| Categoría | Qué detecta |
+|---|---|
+| `manual-object-init` | `new FooDto { A = src.A, B = src.B, … }` — inicializador que copia ≥3 miembros desde un mismo objeto fuente |
+| `manual-assignments` | secuencia `dest.A = src.A; dest.B = src.B; …` (≥3) entre dos objetos de tipos distintos |
+| `manual-mapping-method` | un método/extension dedicado a convertir (`ToDto()`, `ToViewModel()`, un `*MappingExtensions`) cuyo cuerpo es esencialmente lo anterior — AutoMapper debería ser el dueño |
+
+#### Qué NO se reporta (filtro de juicio)
+
+- **Actualizaciones parciales sobre entidades existentes/trackeadas** con
+  semántica de preservar valor (`x.A = src.A?.Trim() ?? x.A`): es lógica de
+  update con estado, no un map puro.
+- Bloques donde **domina la transformación/lógica de negocio** por sobre la copia
+  directa: el check apunta a las copias mayormente directas, no a fabricar
+  `CreateMap` cargados de lógica.
+- Construcción a partir de **escalares o variables locales**, no de otro objeto:
+  no es un mapeo.
+- Mapeos de menos de 3 miembros.
+
+#### Formato en el reporte
+
+Sección **Mapeo manual pudiendo usar el mapper**, agrupada por categoría, una
+ubicación por línea con los tipos involucrados y la sugerencia. Cuando sea
+posible, indicar si el `CreateMap<Src, Dest>` ya existe en `MappingProfile.cs` o
+si hay que agregarlo. Ejemplo:
+
+```
+### Mapeo manual pudiendo usar el mapper
+
+**manual-object-init**
+- Services/PositionApplicantService.cs:88 — new ApplicantApplicationResponseDto { … } copia 6 miembros desde PositionApplicant → usar _mapper.Map<ApplicantApplicationResponseDto>(src) (ya existe CreateMap en MappingProfile)
+
+**manual-mapping-method**
+- Mapping/ApplicantMappingExtensions.cs:12 — ToProfileDto() replica el mapeo; mover a MappingProfile y usar IMapper
+```
+
+Si no hay hallazgos, la sección se omite.
+
 ## Manejo de errores
 
 - Si el PR ID no es un número válido, pide al usuario que verifique.
