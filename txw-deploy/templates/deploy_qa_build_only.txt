@@ -1,5 +1,3 @@
-Version: {{VERSION}}
-
 1. Backup of the db "TruextendWebsiteQA"
 1.1 Obtain a backup of the folder "C:\inetpub\truextendWebsiteQA"
 
