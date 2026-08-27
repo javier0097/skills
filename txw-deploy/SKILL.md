@@ -1,6 +1,6 @@
 ---
 name: TXW-deploy
-description: Automatiza la preparación de artefactos para deploys del proyecto TruextendWebsite a los ambientes QA y PROD. Usá esta skill cuando el usuario mencione hacer un deploy, preparar un deploy, generar artefactos de deploy, armar carpeta de deploy, o cuando invoque /TXW-deploy. Típicamente el usuario dirá algo como 'hacer deploy a QA', 'preparar deploy a PROD con recipe', 'generar artefactos para deploy QA con cambios en X', etc. La skill hace git pull, corre el publish, limpia el build, detecta si necesita script SQL comparando migraciones, arma la carpeta YYYYMMDD-(QA|PROD)[-N] con todos los artefactos, y la sube a la carpeta compartida de Google Drive. Requiere correr desde Claude Code con el working directory en la raíz del repositorio del proyecto.
+description: Automatiza la preparación de artefactos para deploys del proyecto TruextendWebsite a los ambientes QA y PROD. Usá esta skill cuando el usuario mencione hacer un deploy, preparar un deploy, generar artefactos de deploy, armar carpeta de deploy, o cuando invoque /TXW-deploy. Típicamente el usuario dirá algo como 'hacer deploy a QA', 'preparar deploy a PROD con recipe', 'generar artefactos para deploy QA con cambios en X', etc. La skill hace git pull, sube el número de versión en version.props (solo en QA), corre el publish, limpia el build, detecta si necesita script SQL comparando migraciones, arma la carpeta YYYYMMDD-(QA|PROD)[-N] con todos los artefactos, la sube a la carpeta compartida de Google Drive, y propaga los archivos de versión actualizados a las ramas inferiores. Requiere correr desde Claude Code con el working directory en la raíz del repositorio del proyecto.
 ---
 
 # TXW-deploy
@@ -10,6 +10,36 @@ Skill para preparar y subir artefactos de deploy del proyecto **TruextendWebsite
 ## Configuración
 
 Toda la configuración (rutas, nombres de proyecto, constantes de ambiente) está en `config.json` en la raíz de esta skill. **Lee `config.json` al inicio de cada invocación** y usa esos valores en lugar de hardcodearlos.
+
+## Modelo de versionado (leer antes de tocar el flujo)
+
+El proyecto maneja **un solo número de versión** para toda la solución, y dos archivos:
+
+- **`version.props`** (raíz de la solución, en singular) — contiene `<TruextendVersion>`, formato `major.minor.patch` numérico, **sin sufijos** (nada de `-rc1`), porque el valor alimenta `AssemblyVersion`. Se edita a mano antes del publish.
+- **`published-versions.props`** (`TruextendWebsite.Web\Properties\PublishProfiles\`) — registra la última versión publicada a cada ambiente con items `<PublishedVersion Include="QA|Production" Version="..." />`. Lo actualiza automáticamente el target `RecordPublishedVersion` durante el publish. **La skill nunca lo escribe**: solo lo lee.
+
+**Convención `Major.Sprint.Patch`:**
+
+- **Major** — cambia bajo criterio humano. La skill nunca lo propone sola.
+- **Minor** — es el número de sprint. Sube en el **primer deploy a QA de un sprint nuevo**, o sea cuando la versión actual ya salió a Production.
+- **Patch** — sube en **cada deploy a QA** dentro del mismo sprint.
+- **Production no bumpea**: publica exactamente la versión que QA validó.
+
+**`ValidatePublishVersion`** (en `Directory.Build.targets`) enforcea esto y rechaza el publish si:
+- la versión no es estrictamente mayor que el baseline de ese ambiente, o
+- es un publish a Production de una versión distinta a la que QA publicó último.
+
+La skill valida ambas reglas **antes** de compilar (Paso 2.5), así un deploy destinado a fallar se corta al instante en vez de después de varios minutos de build.
+
+**Flujo de ramas:**
+
+1. El publish se hace desde la rama del ambiente: `staging` para QA, `master` para PROD. El gitflow no cambia.
+2. El bump se hace solo en QA, justo antes del publish.
+3. Después de validar el zip, los dos `.props` se commitean en la rama del deploy y se propagan hacia abajo con merges (*backmerge*):
+   - Deploy a QA: `staging` → `develop`
+   - Deploy a PROD: `master` → `staging` → `develop`
+
+**El orden importa**: el bump se escribe *antes* del publish (porque alimenta el build) pero se commitea *después* de validar el zip. Si el publish falla, `version.props` se revierte para no dejar la rama sucia con un bump de un build que nunca existió.
 
 ## Paso 0 — Resolución del base path de la skill (OBLIGATORIO primero)
 
@@ -66,7 +96,8 @@ Información que el usuario puede mencionar en el prompt:
 
 1. **Ambiente**: `QA` o `PROD` (OBLIGATORIO). Si no lo menciona, pregúntaselo antes de avanzar.
 2. **Recipe**: si aparece la palabra "recipe", marca `has_recipe=true`.
-3. **Instrucciones especiales**: cualquier texto que describa una modificación no estándar al Deploy.txt (ej: "agregar X al appsettings").
+3. **Versión**: si menciona un número de versión explícito (ej: "deploy a QA con la 2.4.0"), usalo en el Paso 2.5 en lugar de proponer uno.
+4. **Instrucciones especiales**: cualquier texto que describa una modificación no estándar al Deploy.txt (ej: "agregar X al appsettings").
 
 **NUNCA pidas al usuario si debe haber script SQL** — eso se detecta automáticamente comparando migraciones.
 
@@ -77,13 +108,15 @@ Sigue este orden estrictamente. Valida el éxito de cada paso antes de avanzar a
 ### Paso 1 — Pre-flight
 
 1. Lee `"$SKILL_BASE\config.json"`.
-2. Parsea el prompt del usuario para extraer: `environment` (QA/PROD), `has_recipe` (bool), `special_instructions` (string libre o null).
+2. Parsea el prompt del usuario para extraer: `environment` (QA/PROD), `has_recipe` (bool), `version` (string o null), `special_instructions` (string libre o null).
 3. Si falta el ambiente, pídelo con una sola pregunta y detente hasta tener respuesta.
 4. Determina el publish profile correspondiente según `config.json[publish_profiles]`:
-   - `QA` → `FolderProfile.QA`
-   - `PROD` → `FolderProfile`
+   - `QA` → `QA` (`Properties\PublishProfiles\QA.pubxml`)
+   - `PROD` → `Production` (`Properties\PublishProfiles\Production.pubxml`)
 
-5. Calculá la fecha actual en formato `YYYYMMDD` (zona horaria local de la laptop).
+   El nombre del perfil no es cosmético: `ValidatePublishVersion` y `RecordPublishedVersion` (en `Directory.Build.targets`) están condicionados a `'$(_PublishProfileInUse)' != ''`. Si el perfil no resuelve, ambos targets se saltean **en silencio**: el guard de versión no corre y `published-versions.props` nunca se actualiza.
+5. Leé `config.json[branches][<environment>].bump_version` para saber si este deploy requiere subir el número de versión (`true` en QA, `false` en PROD). Las rutas de los `.props` no hace falta que las resuelvas acá: de eso se encarga el Paso 2.5.
+6. Calculá la fecha actual en formato `YYYYMMDD` (zona horaria local de la laptop).
 
 ### Paso 2 — Validación de git y preparación de la rama
 
@@ -109,6 +142,8 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
    - `git checkout <target>`.
    - Calcula si la rama local está sincronizada con `origin/<target>`. Si está atrasada y limpia, hace `git pull --ff-only`. Si está adelantada o divergente, aborta.
    - Para cada `expected_source`, compara el contenido contra `origin/<target>` (bidireccional, inmune a squash) y clasifica los archivos que difieren según en qué rama tienen el commit más reciente.
+
+   **Al terminar este paso el repo queda parado en la rama del deploy**, que es donde se hace el bump, el publish y el commit de versiones.
 
 3. Salida JSON del script:
 
@@ -158,13 +193,15 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
    - **`target_ahead_files`**: archivos modificados más recientemente en `<target>` que en `<source>`. Es el caso normal de gitflow (ej: un hotfix en `master` que ya está propagado a `staging` pero `develop` aún no lo recibió). **No es motivo de alerta**; se incluye solo como información.
    - **`has_changes`**: depende **solo** de `changed_files`. Si está vacío, `has_changes=false` aunque haya cosas en `target_ahead_files`.
 
+   Nota: es esperable que `version.props` y `published-versions.props` aparezcan en `target_ahead_files` cuando la rama del deploy ya recibió un bump que las inferiores todavía no. No es una alerta.
+
 4. **Manejo del resultado:**
 
    - Si `ok=false` (exit code 1): aborta el deploy. Mostrá al usuario el campo `error` y los detalles relevantes (archivos dirty, contadores ahead/behind, etc.) para que pueda corregir antes de reintentar.
 
    - Si `ok=true`: revisá cada entrada de `propagation` y decidí según **`has_changes`**:
 
-     - Si todas las fuentes tienen `has_changes = false` → no hay nada sin propagar. Seguí con el Paso 3 sin preguntar nada.
+     - Si todas las fuentes tienen `has_changes = false` → no hay nada sin propagar. Seguí con el Paso 2.5 sin preguntar nada.
 
      - Si alguna fuente tiene `has_changes = true` → hay trabajo en la fuente que no está propagado al target. **Mostrá al usuario los archivos afectados (`changed_files`)** y pedí confirmación explícita antes de seguir. Formato sugerido:
 
@@ -179,6 +216,69 @@ Este paso unifica todas las validaciones de git previas al deploy: working direc
        Si el usuario no responde afirmativamente de forma clara (`sí`, `seguir`, `s`, etc.), **abortá el deploy**. Default seguro: ante duda, no avanzar.
 
        Los archivos en `target_ahead_files` NO se muestran ni disparan alerta: son el caso normal de gitflow.
+
+### Paso 2.5 — Estado de versión y bump
+
+Este paso corre **siempre**, en QA y en PROD. En QA además hace el bump; en PROD solo valida.
+
+1. Ejecutá el script de estado de versión:
+
+   ```powershell
+   pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\resolve_version_state.ps1" `
+       -ConfigPath "$SKILL_BASE\config.json" `
+       -Environment "<QA|PROD>"
+   ```
+
+   El script localiza `version.props` (acepta también `versions.props`) y `published-versions.props`, lee la versión actual y los baselines de cada ambiente, y aplica la convención `Major.Sprint.Patch` para proponer el número que corresponde. No escribe nada.
+
+   Salida JSON:
+
+   ```json
+   {
+       "ok": true,
+       "versions_props_path": "version.props",
+       "published_versions_props_path": "TruextendWebsite.Web\\Properties\\PublishProfiles\\published-versions.props",
+       "version_element": "TruextendVersion",
+       "current_version": "2.11.3",
+       "baselines": { "QA": "2.11.3", "Production": "2.11.3" },
+       "environment": "QA",
+       "bump_required": true,
+       "suggested_version": "2.12.0",
+       "suggestion_reason": "La versión 2.11.3 ya se publicó a Production, así que el sprint está cerrado...",
+       "validation": { "status": "ok", "messages": [] }
+   }
+   ```
+
+   **Guardá `versions_props_path` y `published_versions_props_path`**: los vas a pasar a los scripts de los Pasos 4-6 y 9.5.
+
+2. **Manejo de `validation.status`:**
+
+   - `"ok"` → seguí.
+   - `"warning"` → mostrale los `messages` al usuario y seguí (típicamente: el bump ya estaba aplicado de un publish anterior que falló).
+   - `"error"` (exit code 1) → **abortá**. Son los casos que `ValidatePublishVersion` va a rechazar: en PROD, que `version.props` no coincida con lo que QA publicó, o que la versión ya se haya desplegado. Mostrá los `messages`, que ya explican qué revisar.
+
+3. **Si `bump_required = false` (PROD)**: no toques `version.props`. Informá qué versión se va a desplegar (`current_version`) y seguí con el Paso 3.
+
+4. **Si `bump_required = true` (QA)**: mostrá la propuesta y **pedí confirmación explícita**:
+
+   > Versión actual: **2.11.3**
+   > Propuesta para este deploy a QA: **2.12.0**
+   >
+   > Motivo: la 2.11.3 ya salió a Production, así que este es el primer deploy del sprint 12.
+   >
+   > ¿Confirmás, o querés otro número?
+
+   El `suggestion_reason` del JSON ya trae el motivo redactado: usalo, no lo reformules.
+
+   **Siempre preguntá, aunque la propuesta parezca obvia.** Hay excepciones a la convención (un cambio de major, o un sprint que no cierra con un deploy a PROD) que solo el usuario conoce. Este es el único valor del deploy que queda inmutable en el historial de git.
+
+   Si el usuario propone otro número, validá que sea `major.minor.patch` sin sufijos y estrictamente mayor que el baseline de QA. Si no lo es, decíselo y volvé a preguntar.
+
+5. **Editá `version.props`** reemplazando el contenido de `<TruextendVersion>` por el número confirmado. Es un reemplazo de una línea: no reformatees el archivo ni toques los comentarios.
+
+6. **No commitees todavía.** El commit se hace en el Paso 9.5, junto con `published-versions.props`, después de validar el zip.
+
+7. **Guardá el número confirmado** en una variable `version`: lo usás en el Deploy.txt (Paso 8) y en el mensaje de commit (Paso 9.5).
 
 ### Paso 3 — Resolver nombre de carpeta de deploy y del zip
 
@@ -224,20 +324,34 @@ pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\build_and_package.ps1" `
     -PublishProfile "<profile_sin_extension>" `
     -BuildOutputPath "<build_output_path>" `
     -DeployFolder "<deploys_root>\<folder_name>" `
-    -ZipName "<zip_name>"
+    -ZipName "<zip_name>" `
+    -VersionsPropsPath "<versions_props_path del Paso 2.5>" `
+    -PublishedVersionsPropsPath "<published_versions_props_path del Paso 2.5>" `
+    [-RevertVersionsPropsOnFailure]
 ```
+
+Pasá `-RevertVersionsPropsOnFailure` **solo si hiciste el bump** en el Paso 2.5 (es decir, solo en QA). En PROD omitilo: no tocaste `version.props`, así que no hay nada que revertir.
 
 El script hace internamente:
 
-1. **Publish**: `dotnet publish <startup> -p:PublishProfile=<profile> --configuration Release`.
-2. **Valida** que el build se generó correctamente.
-3. **Limpieza del build**:
+1. **Snapshot** del hash de `published-versions.props` antes de compilar.
+2. **Publish**: `dotnet publish <startup> -p:PublishProfile=<profile> --configuration Release`.
+3. **Valida** que el build se generó correctamente. Si el publish falla y se pasó `-RevertVersionsPropsOnFailure`, hace `git checkout -- version.props` para dejar la rama limpia.
+4. **Verifica que el publish regeneró `published-versions.props`** comparando el hash. Esto NO aborta el build; se reporta en la última línea del output:
+   `[RESULT] published_versions_changed=true|false|unknown`
+5. **Limpieza del build**:
    - Borra `App_Data/tenants.json` (si existe; si no, warning pero no aborta).
    - Vacía el contenido de `App_Data/Sites/Default/` (borra todos los archivos y subcarpetas adentro, pero mantiene la carpeta `Default`).
-4. **Crea** la carpeta de deploy con el nombre calculado.
-5. **Comprime** el contenido del build a `<zip_name>` DENTRO de la carpeta de deploy.
-6. **Valida** que el zip existe y tiene tamaño > 0. Si falla, aborta SIN borrar el build original.
-7. Solo si el zip es válido, **borra la carpeta original del build**.
+6. **Crea** la carpeta de deploy con el nombre calculado.
+7. **Comprime** el contenido del build a `<zip_name>` DENTRO de la carpeta de deploy.
+8. **Valida** que el zip existe y tiene tamaño > 0. Si falla, aborta SIN borrar el build original.
+9. Solo si el zip es válido, **borra la carpeta original del build**.
+
+**Manejo de `published_versions_changed`:**
+
+- `true` → todo normal, seguí.
+- `false` → el publish no modificó el archivo. En un deploy a QA con bump esto no debería pasar; avisale al usuario y **pedí confirmación antes de seguir** (puede indicar que el target de versionado no corrió). En PROD es menos raro pero igual conviene mencionarlo.
+- `unknown` → no se encontró el archivo. Avisá que hay que revisar la ruta en `config.version_files` y seguí (el build es válido).
 
 Si el script falla (exit code != 0), aborta mostrando el error.
 
@@ -290,7 +404,9 @@ Este paso usa dos scripts para minimizar tokens: uno para encontrar la carpeta c
    - QA con script → `"$SKILL_BASE\templates\deploy_qa_with_script.txt"`
    - PROD sin script → `"$SKILL_BASE\templates\deploy_prod_build_only.txt"`
    - PROD con script → `"$SKILL_BASE\templates\deploy_prod_with_script.txt"`
-2. Los templates tienen placeholder `{{ZIP_NAME}}`. Reemplázalo por el `zip_name` calculado en el Paso 3.
+2. Los templates tienen dos placeholders:
+   - `{{ZIP_NAME}}` → reemplazalo por el `zip_name` calculado en el Paso 3.
+   - `{{VERSION}}` → reemplazalo por la versión de este deploy. En QA es la que confirmaste en el Paso 2.5. En PROD es el `current_version` que devolvió el Paso 2.5. Si no pudiste determinarla, poné `N/A` en vez de inventar un número.
 3. Si el usuario mencionó `special_instructions`:
    - Adapta la instrucción según el ambiente (ej: `appsettings.QA.json` vs `appsettings.json`).
    - Intercala los pasos adicionales en el lugar correcto del template (típicamente entre "Copy configuration files" y "Run script/Start"), renumerando los pasos posteriores.
@@ -306,6 +422,50 @@ Si `has_recipe=true`:
 3. Valida que `update-recipe.json` existe en la carpeta.
 4. Copia `"$SKILL_BASE\templates\admin_tasks.txt"` a `<deploys_root>\<folder_name>\Admin tasks.txt`.
 
+### Paso 9.5 — Commit y propagación de los archivos de versión
+
+Este paso corre **después** de que el zip está validado y el Deploy.txt confirmado, y **antes** de subir a Drive. El orden no es arbitrario: no querés pushear una versión de un deploy que todavía podía abortarse.
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\propagate_versions.ps1" `
+    -ConfigPath "$SKILL_BASE\config.json" `
+    -Environment "<QA|PROD>" `
+    -Version "<version o cadena vacía>" `
+    -VersionsPropsPath "<versions_props_path del Paso 2.5>" `
+    -PublishedVersionsPropsPath "<published_versions_props_path del Paso 2.5>"
+```
+
+El script hace internamente:
+
+1. Valida que el repo esté parado en la rama del deploy (`staging` en QA, `master` en PROD). Si no, aborta sin commitear nada.
+2. Stagea `version.props` y `published-versions.props`.
+3. **Si no hay cambios en ninguno de los dos**, sale con `ok=true` y `committed=false` sin hacer commits vacíos ni merges. Es un caso raro pero contemplado.
+4. Commitea con mensaje `chore(version): update version files after <version> deploy to <QA|PROD>`.
+5. Pushea la rama del deploy. Si el push se rechaza, aborta **antes** de tocar las demás ramas.
+6. Recorre `backmerge_chain` mergeando cada rama desde la anterior y pusheando:
+   - QA: `staging` → `develop`
+   - PROD: `master` → `staging` → `develop`
+7. Vuelve a la rama del deploy.
+
+Salida JSON:
+
+```json
+{
+    "ok": true,
+    "committed": true,
+    "commit_sha": "a1b2c3d",
+    "changed_files": ["version.props", "published-versions.props"],
+    "propagated_branches": ["develop"],
+    "steps": ["..."]
+}
+```
+
+**Manejo del resultado:**
+
+- `ok=true, committed=true` → mostrá al usuario qué ramas quedaron actualizadas y seguí con la subida a Drive.
+- `ok=true, committed=false` → avisá que no hubo cambios de versión que propagar y seguí.
+- `ok=false` → **no abortes el deploy**. El artefacto ya está armado y es válido; lo que falló es la propagación en git. Mostrá el `error` y el array `steps` (que indica hasta dónde llegó), decile al usuario qué le queda por resolver a mano, y **seguí con la subida a Drive**. Un conflicto de merge en `develop` no invalida el zip.
+
 ### Paso 10 — Subida a Drive
 
 1. Copia la carpeta completa `<deploys_root>\<folder_name>\` a `<drive_deploys_folder>\<folder_name>\`.
@@ -316,6 +476,7 @@ Si `has_recipe=true`:
    - Ruta de la carpeta creada localmente.
    - Lista de archivos que contiene.
    - Ruta destino en Drive.
+   - **Versión desplegada y ramas que recibieron el commit de versiones.**
 
 ## Manejo de errores
 
@@ -323,20 +484,42 @@ Si `has_recipe=true`:
 - Si el check de readiness falla con `local_sync.status="ahead"` → aborta y pide al usuario que haga `git push` antes de deployar.
 - Si el check de readiness falla con `local_sync.status="diverged"` → aborta y pide al usuario que resuelva el merge/rebase antes de deployar.
 - Si hay cambios sin propagar (`propagation[].has_changes = true`, es decir, archivos en `changed_files`) y el usuario no confirma explícitamente → aborta.
-- Si `dotnet publish` falla → muestra la última parte del output y aborta.
+- Si `resolve_version_state.ps1` devuelve `validation.status="error"` → abortá antes de compilar: el publish sería rechazado por `ValidatePublishVersion`.
+- Si `resolve_version_state.ps1` no encuentra `version.props` o `published-versions.props` → abortá indicando las rutas que probó; hay que corregir `config.version_files`.
+- Si el usuario no confirma el número de versión propuesto → no escribas el archivo; pedile el número que quiere.
+- Si el usuario propone una versión con sufijo (`-rc1`) o menor o igual al baseline de QA → rechazala y explicá por qué; el build fallaría igual.
+- Si `dotnet publish` falla → muestra la última parte del output y aborta. Si hiciste bump, verificá que el script haya revertido `version.props` (`git status` debe estar limpio); si no, revertilo vos.
+- Si `published_versions_changed=false` en un deploy a QA → avisá y pedí confirmación antes de seguir.
 - Si falta el publish profile esperado → aborta indicando el path que esperaba.
 - Si la detección de migraciones no encuentra scripts pasados del ambiente → aborta e informa.
 - Si `dotnet ef migrations script` falla → muestra el error y aborta.
 - Si la compresión falla o el zip queda vacío → aborta SIN borrar el build original.
-- Si el usuario no confirma el Deploy.txt → no subas nada a Drive, deja todo en local para que pueda revisar manualmente.
+- Si el usuario no confirma el Deploy.txt → no subas nada a Drive, deja todo en local para que pueda revisar manualmente. Tampoco corras la propagación de versiones.
+- Si la propagación de versiones falla (`propagate_versions.ps1` con `ok=false`) → NO abortes el deploy. Informá qué quedó pendiente y continuá con la subida a Drive.
+- Si el push de la rama del deploy se rechaza porque alguien pusheó mientras corría el deploy → el commit queda local; avisale al usuario que haga `git pull --rebase` y vuelva a correr solo la propagación.
 
 ## Optimización de tokens
 
 - Lee `config.json` una sola vez al inicio.
 - NO cargues al contexto el contenido del build, del zip, ni del script.sql generado. Solo valida existencia y tamaño.
+- NO leas `version.props` ni `published-versions.props` desde Claude: `resolve_version_state.ps1` te devuelve la versión actual, los baselines y la propuesta en un JSON chico. Solo abrí `version.props` para editarlo en el Paso 2.5.
 - Para la lectura del último script.sql pasado, NO lo leas desde Claude — delegalo al script `detect_migration.ps1`, que internamente lee solo las últimas 200 líneas y retorna únicamente el JSON con la información necesaria.
 - Prefiere ejecutar scripts PowerShell que hagan múltiples operaciones en una sola llamada, en lugar de muchos comandos bash separados.
-- No repitas información al usuario en cada paso; muestra progreso solo en hitos importantes (después del publish, antes de confirmar Deploy.txt, al finalizar).
+
+## Chequeo de sintaxis (después de editar cualquier script)
+
+Un error de parseo en un `.ps1` no se manifiesta como un fallo parcial: el script sale con exit 1 **sin emitir JSON**, y el paso que dependía de él se corta entero. Después de tocar cualquier script, corré:
+
+```powershell
+Get-ChildItem "$SKILL_BASE\scripts\*.ps1" | ForEach-Object {
+    $e = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$e)
+    if ($e.Count) { "$($_.Name): $($e[0].Message)" }
+}
+```
+
+Sin salida = todos parsean. El error más fácil de cometer en este código es `"texto $variable: más texto"` dentro de un string: PowerShell lee `$variable:` como un scope/drive y falla. Se arregla con `$($variable):`.
+- No repitas información al usuario en cada paso; muestra progreso solo en hitos importantes (después del bump, después del publish, antes de confirmar Deploy.txt, después de la propagación, al finalizar).
 
 ## Detalle importante sobre paths en Windows
 

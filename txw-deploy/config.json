@@ -9,8 +9,15 @@
     "migrations_folder_relative_path": "Modules\\Truextend.Core\\Migrations",
     "_ef_note": "Rutas relativas al proyecto/migraciones de EF. Ajustá si la estructura es diferente.",
 
-    "build_output_path": "C:\\Users\\JavierMartinez\\source\\deploy builds\\TruextendWebsite\\build",
-    "_build_output_note": "Esta es la ruta donde el pubxml deja el build. Debe coincidir con <PublishDir> de FolderProfile.pubxml y FolderProfile.QA.pubxml",
+    "version_files": {
+        "versions_props": "version.props",
+        "published_versions_props": "TruextendWebsite.Web\\Properties\\PublishProfiles\\published-versions.props",
+        "version_element": "TruextendVersion"
+    },
+    "_version_files_note": "Rutas RELATIVAS a la raíz de la solución. 'versions_props' apunta a version.props (SINGULAR, así se llama el archivo en el repo; la clave conserva el plural por compatibilidad con los scripts) y contiene el único número de versión del proyecto (<TruextendVersion>, formato major.minor.patch sin sufijos) y se edita antes del publish, solo en QA. 'published_versions_props' registra el último número publicado a cada ambiente (items <PublishedVersion Include=\"QA|Production\" />) y lo actualiza automáticamente el target RecordPublishedVersion durante el publish: la skill NUNCA lo escribe, solo lo lee para proponer la versión y para anticipar los rechazos de ValidatePublishVersion. Si no encuentra las rutas configuradas, el script las busca en el repo.",
+
+    "build_output_path": "TruextendWebsite.Web\\bin\\Release\\net10.0\\publish",
+    "_build_output_note": "Ruta RELATIVA a la raíz de la solución donde el pubxml deja el build. Debe coincidir con <publishUrl> de QA.pubxml y Production.pubxml (que desde el PR 1387 es relativo al proyecto: bin\\Release\\net10.0\\publish). Está bajo bin/, que es gitignored, así que el script puede borrarla sin riesgo.",
 
     "deploys_root": "C:\\Users\\JavierMartinez\\source\\deploy builds\\TruextendWebsite",
     "_deploys_root_note": "Ahí se crean las carpetas YYYYMMDD-QA o YYYYMMDD-PROD localmente",
@@ -21,24 +28,28 @@
     "git_status_whitelist": [
         "appsettings.Development.json"
     ],
-    "_whitelist_note": "Archivos cuyos cambios sin commitear se ignoran al validar git status",
+    "_whitelist_note": "Archivos cuyos cambios sin commitear se ignoran al validar git status. IMPORTANTE: NO agregar acá version.props ni published-versions.props — esos cambios se commitean, no se ignoran.",
 
     "publish_profiles": {
-        "QA": "FolderProfile.QA",
-        "PROD": "FolderProfile"
+        "QA": "QA",
+        "PROD": "Production"
     },
 
     "branches": {
         "QA": {
             "target": "staging",
-            "expected_sources": ["develop", "master"]
+            "expected_sources": ["develop", "master"],
+            "bump_version": true,
+            "backmerge_chain": ["develop"]
         },
         "PROD": {
             "target": "master",
-            "expected_sources": ["staging"]
+            "expected_sources": ["staging"],
+            "bump_version": false,
+            "backmerge_chain": ["staging", "develop"]
         }
     },
-    "_branches_note": "Configuración del gitflow. 'target' es la rama desde la que se hace el deploy al ambiente. 'expected_sources' son las ramas que deberían estar propagadas en target; si hay commits en alguna de ellas que no estén en target, la skill muestra los commits y pide confirmación antes de deployar.",
+    "_branches_note": "Configuración del gitflow. 'target' es la rama desde la que se hace el deploy al ambiente (y donde se commitean los archivos de versión). 'expected_sources' son las ramas que deberían estar propagadas en target; si hay commits en alguna de ellas que no estén en target, la skill muestra los archivos y pide confirmación antes de deployar. 'bump_version' indica si hay que subir el número de versión en version.props antes del publish (solo en QA; en PROD la versión ya viene arrastrada desde staging). 'backmerge_chain' es la secuencia de ramas que reciben el commit de versiones después del deploy, mergeando cada una desde la anterior: QA hace staging→develop; PROD hace master→staging→develop.",
 
     "environment_constants": {
         "QA": {
