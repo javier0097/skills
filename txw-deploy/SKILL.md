@@ -35,11 +35,11 @@ La skill valida ambas reglas **antes** de compilar (Paso 2.5), así un deploy de
 
 1. El publish se hace desde la rama del ambiente: `staging` para QA, `master` para PROD. El gitflow no cambia.
 2. El bump se hace solo en QA, justo antes del publish.
-3. Después de validar el zip, los dos `.props` se commitean en la rama del deploy y se propagan hacia abajo con merges (*backmerge*):
+3. Al final de todo, ya con los artefactos en Drive, los dos `.props` se commitean en la rama del deploy y se propagan hacia abajo con merges (*backmerge*):
    - Deploy a QA: `staging` → `develop`
    - Deploy a PROD: `master` → `staging` → `develop`
 
-**El orden importa**: el bump se escribe *antes* del publish (porque alimenta el build) pero se commitea *después* de validar el zip. Si el publish falla, `version.props` se revierte para no dejar la rama sucia con un bump de un build que nunca existió.
+**El orden importa**: el bump se escribe *antes* del publish (porque alimenta el build) pero se commitea al final del flujo, en el último paso. Si el publish falla, `version.props` se revierte para no dejar la rama sucia con un bump de un build que nunca existió.
 
 ## Paso 0 — Resolución del base path de la skill (OBLIGATORIO primero)
 
@@ -249,7 +249,7 @@ Este paso corre **siempre**, en QA y en PROD. En QA además hace el bump; en PRO
    }
    ```
 
-   **Guardá `versions_props_path` y `published_versions_props_path`**: los vas a pasar a los scripts de los Pasos 4-6 y 9.5.
+   **Guardá `versions_props_path` y `published_versions_props_path`**: los vas a pasar a los scripts de los Pasos 4-6 y 11.
 
 2. **Manejo de `validation.status`:**
 
@@ -276,9 +276,9 @@ Este paso corre **siempre**, en QA y en PROD. En QA además hace el bump; en PRO
 
 5. **Editá `version.props`** reemplazando el contenido de `<TruextendVersion>` por el número confirmado. Es un reemplazo de una línea: no reformatees el archivo ni toques los comentarios.
 
-6. **No commitees todavía.** El commit se hace en el Paso 9.5, junto con `published-versions.props`, después de validar el zip.
+6. **No commitees todavía.** El commit se hace en el Paso 11, junto con `published-versions.props`, después de validar el zip.
 
-7. **Guardá el número confirmado** en una variable `version`: lo usás en el Deploy.txt (Paso 8) y en el mensaje de commit (Paso 9.5).
+7. **Guardá el número confirmado** en una variable `version`: lo usás en el mensaje de commit del Paso 11.
 
 ### Paso 3 — Resolver nombre de carpeta de deploy y del zip
 
@@ -404,9 +404,8 @@ Este paso usa dos scripts para minimizar tokens: uno para encontrar la carpeta c
    - QA con script → `"$SKILL_BASE\templates\deploy_qa_with_script.txt"`
    - PROD sin script → `"$SKILL_BASE\templates\deploy_prod_build_only.txt"`
    - PROD con script → `"$SKILL_BASE\templates\deploy_prod_with_script.txt"`
-2. Los templates tienen dos placeholders:
+2. Los templates tienen un placeholder:
    - `{{ZIP_NAME}}` → reemplazalo por el `zip_name` calculado en el Paso 3.
-   - `{{VERSION}}` → reemplazalo por la versión de este deploy. En QA es la que confirmaste en el Paso 2.5. En PROD es el `current_version` que devolvió el Paso 2.5. Si no pudiste determinarla, poné `N/A` en vez de inventar un número.
 3. Si el usuario mencionó `special_instructions`:
    - Adapta la instrucción según el ambiente (ej: `appsettings.QA.json` vs `appsettings.json`).
    - Intercala los pasos adicionales en el lugar correcto del template (típicamente entre "Copy configuration files" y "Run script/Start"), renumerando los pasos posteriores.
@@ -422,9 +421,33 @@ Si `has_recipe=true`:
 3. Valida que `update-recipe.json` existe en la carpeta.
 4. Copia `"$SKILL_BASE\templates\admin_tasks.txt"` a `<deploys_root>\<folder_name>\Admin tasks.txt`.
 
-### Paso 9.5 — Commit y propagación de los archivos de versión
+### Paso 10 — Subida a Drive
 
-Este paso corre **después** de que el zip está validado y el Deploy.txt confirmado, y **antes** de subir a Drive. El orden no es arbitrario: no querés pushear una versión de un deploy que todavía podía abortarse.
+1. Copia la carpeta completa `<deploys_root>\<folder_name>\` a `<drive_deploys_folder>\<folder_name>\`.
+2. Usa `Copy-Item -Recurse` en PowerShell o `robocopy`.
+3. Después de copiar, espera unos segundos y valida que la carpeta existe en el destino.
+4. **Nota importante**: Drive para escritorio sincroniza en segundo plano. La carpeta aparecerá localmente de inmediato en `G:\`, pero la sincronización a la nube puede tardar unos segundos o minutos. Informale al usuario que la copia local ya terminó y que Drive la sincronizará automáticamente.
+5. Muestra un resumen con:
+   - Ruta de la carpeta creada localmente.
+   - Lista de archivos que contiene.
+   - Ruta destino en Drive.
+   - Versión que se está desplegando.
+6. **Invitá al usuario a revisar los archivos en Drive antes de seguir.** El Paso 11 es el primero que escribe en el remoto, así que este es el último momento para rehacer algo sin tener que revertir commits.
+
+### Paso 11 — Commit y propagación de los archivos de versión
+
+Este es el **último** paso del flujo, y el único que escribe en el remoto. Va al final a propósito: todo lo anterior es reversible borrando una carpeta, mientras que esto deja commits en tres ramas. Si al revisar los archivos en Drive aparece algo para corregir, todavía estás a tiempo de rehacer el deploy sin ensuciar el historial.
+
+**Antes de ejecutar el script, pedí confirmación explícita:**
+
+> Los artefactos ya están en Drive. Falta commitear los archivos de versión y propagarlos.
+>
+> - Commit en `<rama del deploy>`: `version.props` + `published-versions.props`
+> - Backmerge: `<cadena de ramas>`
+>
+> ¿Reviso algo más antes, o propago?
+
+Si el usuario quiere corregir algo, **no corras el script**: `version.props` queda modificado sin commitear en la rama del deploy, que es exactamente el estado desde el que puede rehacer el publish sin perder el bump.
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File "$SKILL_BASE\scripts\propagate_versions.ps1" `
@@ -462,21 +485,12 @@ Salida JSON:
 
 **Manejo del resultado:**
 
-- `ok=true, committed=true` → mostrá al usuario qué ramas quedaron actualizadas y seguí con la subida a Drive.
-- `ok=true, committed=false` → avisá que no hubo cambios de versión que propagar y seguí.
-- `ok=false` → **no abortes el deploy**. El artefacto ya está armado y es válido; lo que falló es la propagación en git. Mostrá el `error` y el array `steps` (que indica hasta dónde llegó), decile al usuario qué le queda por resolver a mano, y **seguí con la subida a Drive**. Un conflicto de merge en `develop` no invalida el zip.
+- `ok=true, committed=true` → mostrá al usuario qué ramas quedaron actualizadas. El deploy terminó.
+- `ok=true, committed=false` → avisá que no hubo cambios de versión que propagar. El deploy terminó.
+- `ok=false` → el deploy en sí ya está hecho: los artefactos están en Drive y son válidos. Lo que falló es la propagación en git. Mostrá el `error` y el array `steps` (que indica hasta dónde llegó) y decile al usuario qué le queda por resolver a mano. Un conflicto de merge en `develop` no invalida nada de lo que ya se subió.
 
-### Paso 10 — Subida a Drive
+Al terminar, mostrá el resumen final: versión desplegada, commit creado, y ramas que quedaron actualizadas.
 
-1. Copia la carpeta completa `<deploys_root>\<folder_name>\` a `<drive_deploys_folder>\<folder_name>\`.
-2. Usa `Copy-Item -Recurse` en PowerShell o `robocopy`.
-3. Después de copiar, espera unos segundos y valida que la carpeta existe en el destino.
-4. **Nota importante**: Drive para escritorio sincroniza en segundo plano. La carpeta aparecerá localmente de inmediato en `G:\`, pero la sincronización a la nube puede tardar unos segundos o minutos. Informale al usuario que la copia local ya terminó y que Drive la sincronizará automáticamente.
-5. Muestra un resumen final con:
-   - Ruta de la carpeta creada localmente.
-   - Lista de archivos que contiene.
-   - Ruta destino en Drive.
-   - **Versión desplegada y ramas que recibieron el commit de versiones.**
 
 ## Manejo de errores
 
@@ -495,7 +509,8 @@ Salida JSON:
 - Si `dotnet ef migrations script` falla → muestra el error y aborta.
 - Si la compresión falla o el zip queda vacío → aborta SIN borrar el build original.
 - Si el usuario no confirma el Deploy.txt → no subas nada a Drive, deja todo en local para que pueda revisar manualmente. Tampoco corras la propagación de versiones.
-- Si la propagación de versiones falla (`propagate_versions.ps1` con `ok=false`) → NO abortes el deploy. Informá qué quedó pendiente y continuá con la subida a Drive.
+- Si el usuario no confirma la propagación del Paso 11 → no corras el script y dejá `version.props` modificado sin commitear: es el estado desde el que puede rehacer el deploy conservando el bump.
+- Si la propagación de versiones falla (`propagate_versions.ps1` con `ok=false`) → el deploy ya está completo; informá qué ramas quedaron sin actualizar y qué hay que resolver a mano.
 - Si el push de la rama del deploy se rechaza porque alguien pusheó mientras corría el deploy → el commit queda local; avisale al usuario que haga `git pull --rebase` y vuelva a correr solo la propagación.
 
 ## Optimización de tokens
