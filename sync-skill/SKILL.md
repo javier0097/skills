@@ -68,7 +68,15 @@ Guarda la ruta encontrada en una variable (la llamaremos `SKILL_SOURCE` en los p
 Revisa si existe la carpeta `<nombre-skill>/` en la raíz del repositorio local. **Esta verificación es válida porque ya se hizo `git pull` en el Paso 3**, así que el filesystem refleja el estado real de master.
 
 - Si **no existe** → es una skill nueva (creación).
-- Si **existe** → compara recursivamente todo el contenido de la carpeta local contra `SKILL_SOURCE`. Usa `diff -r` para esto. Si no hay diferencias, informa al usuario que la skill ya está sincronizada y detente.
+- Si **existe** → compara recursivamente todo el contenido de la carpeta local contra `SKILL_SOURCE`. Si no hay diferencias, informa al usuario que la skill ya está sincronizada y detente.
+
+**La comparación debe ignorar los finales de línea.** El caché de Claude guarda los archivos con LF, pero un repo con `core.autocrlf=true` y sin `.gitattributes` materializa la copia de trabajo con CRLF apenas git la re-escribe (clon nuevo, `git checkout` de rama, `git pull`). Un `diff -r` a secas reporta entonces TODOS los archivos como distintos aunque el contenido sea idéntico, lo que vuelve inalcanzable el camino "ya está sincronizada" y ensucia el mensaje de commit del Paso 8. Usa siempre `--strip-trailing-cr`:
+
+```bash
+diff -r --strip-trailing-cr ./<nombre-skill> "$SKILL_SOURCE"
+```
+
+Guarda esta salida: el Paso 8 la usa para redactar el mensaje de commit.
 
 ### Paso 6: Crear la rama de trabajo
 
@@ -117,12 +125,26 @@ Haz stage de todos los cambios y crea el commit. El mensaje siempre empieza con 
 Para generar la descripción:
 
 - **Skill nueva:** lee brevemente el SKILL.md para entender el propósito de la skill y descríbelo. Ejemplo: `sync/conversor-bolivia: add skill for bolivian unit conversions`
-- **Actualización:** usa la salida del `diff -r` del Paso 5 para resumir qué archivos cambiaron y la naturaleza del cambio en una oración. Ejemplo: `sync/saludo: update greeting message and add fallback response`
+- **Actualización:** usa la salida del `diff -r --strip-trailing-cr` del Paso 5 para resumir qué archivos cambiaron y la naturaleza del cambio en una oración. Ejemplo: `sync/saludo: update greeting message and add fallback response`
+
+**Guarda contra el commit vacío.** Aunque el Paso 5 haya detectado diferencias, `git add` normaliza los finales de línea y puede producir blobs idénticos a HEAD. Si no queda nada staged, el `git commit` falla con "nothing to commit" y deja una rama huérfana sin commit, con el repo en un estado raro. Verifica antes de commitear y aborta limpiamente:
 
 ```bash
 git add ./<nombre-skill>
+
+if git diff --cached --quiet; then
+  echo "ℹ️  Nada quedó staged: el contenido del repo ya es idéntico al del caché."
+  git checkout master
+  git checkout -- .
+  git branch -D <nombre-exacto-de-la-rama>
+  echo "✅ La skill ya estaba sincronizada. No se creó rama ni commit."
+  exit 0
+fi
+
 git commit -m "sync/<nombre-skill>: <descripcion-generada>"
 ```
+
+Si este guard se dispara, **no ejecutes los Pasos 9 y 10**: la ejecución termina acá, e informa al usuario que la skill ya estaba sincronizada.
 
 ### Paso 9: Push
 
