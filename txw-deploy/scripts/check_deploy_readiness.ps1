@@ -85,29 +85,78 @@ function Emit-Result {
     exit ($(if ($Ok) { 0 } else { 1 }))
 }
 
+function ConvertTo-NativeArgString {
+    # Quoting según las reglas de CommandLineToArgvW (Windows). Solo se usa en
+    # Windows PowerShell 5.1, donde ProcessStartInfo.ArgumentList no existe
+    # (se agregó en .NET Core 2.1).
+    param([string[]]$Arguments)
+
+    $quoted = foreach ($arg in $Arguments) {
+        if ($arg -eq "") {
+            '""'
+        }
+        elseif ($arg -notmatch '[\s"]') {
+            $arg
+        }
+        else {
+            # Duplicar los backslashes que preceden a una comilla y escapar la comilla.
+            $escaped = [regex]::Replace($arg, '(\\*)"', '$1$1\"')
+            # Duplicar los backslashes finales, que quedarían pegados a la comilla de cierre.
+            $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+            '"' + $escaped + '"'
+        }
+    }
+
+    return ($quoted -join ' ')
+}
+
 function Invoke-Git {
-    # Ejecuta git capturando stdout y stderr juntos pero SIN usar 2>&1 en pipeline,
-    # para evitar el NativeCommandError en Windows PowerShell 5.1.
-    # Usa Start-Process redirigiendo a archivos temporales.
+    # Ejecuta git capturando stdout y stderr por separado.
+    #
+    # NO usar Start-Process -ArgumentList: une los argumentos con espacios SIN
+    # entrecomillar los que contienen espacios, así que un mensaje de commit se
+    # parte en tokens y git toma los sobrantes como pathspecs.
+    #
+    # NO usar `2>&1` en pipeline: en Windows PowerShell 5.1 convierte cualquier
+    # escritura a stderr (incluso informativa) en NativeCommandError, que con
+    # $ErrorActionPreference="Stop" aborta el script aunque git haya salido con 0.
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$Arguments
     )
 
-    $stdoutFile = [System.IO.Path]::GetTempFileName()
-    $stderrFile = [System.IO.Path]::GetTempFileName()
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "git"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    if ($psi.PSObject.Properties.Name -contains "ArgumentList") {
+        # PowerShell 7 / .NET Core: cada argumento se escapa por separado.
+        foreach ($arg in $Arguments) { [void]$psi.ArgumentList.Add($arg) }
+    }
+    else {
+        # Windows PowerShell 5.1: armamos la línea a mano con el quoting correcto.
+        $psi.Arguments = ConvertTo-NativeArgString -Arguments $Arguments
+    }
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
 
     try {
-        $proc = Start-Process -FilePath "git" `
-            -ArgumentList $Arguments `
-            -NoNewWindow `
-            -Wait `
-            -PassThru `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile
+        [void]$proc.Start()
 
-        $stdout = Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue
-        $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
+        # Leemos de forma asíncrona ANTES del WaitForExit: si el buffer de un pipe
+        # se llena (un `git diff` grande, por ejemplo) y nadie lo drena, el proceso
+        # queda bloqueado y WaitForExit no vuelve nunca.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        $proc.WaitForExit()
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
 
         return [PSCustomObject]@{
             ExitCode = $proc.ExitCode
@@ -116,8 +165,7 @@ function Invoke-Git {
         }
     }
     finally {
-        Remove-Item $stdoutFile -ErrorAction SilentlyContinue
-        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+        $proc.Dispose()
     }
 }
 

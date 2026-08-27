@@ -39,8 +39,12 @@ try {
         exit 1
     }
 
-    # Patrón: 8 dígitos (fecha), guion, el ambiente, opcionalmente -N (contador)
-    $folderPattern = "^(\d{8})-$Environment(?:-(\d+))?$"
+    # Patrón: 8 dígitos (fecha), guion, el ambiente, opcionalmente -N (contador),
+    # y opcionalmente un sufijo libre entre paréntesis. Ese último tramo importa:
+    # en Drive existen carpetas como "20260813-QA (.NET 10)" y, si las
+    # descartáramos, podríamos saltear la que tiene el último script.sql y
+    # generar el script desde una migración más vieja de la que corresponde.
+    $folderPattern = "^(\d{8})-$Environment(?:-(\d+))?(?:\s+\(.*\))?$"
 
     # Listar carpetas que matchean el patrón, extrayendo fecha y contador para ordenar.
     # Nota: ordenar solo por nombre alfabético NO sirve porque "YYYYMMDD-QA-10" < "YYYYMMDD-QA-2"
