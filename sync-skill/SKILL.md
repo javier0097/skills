@@ -1,6 +1,6 @@
 ---
 name: sync-skill
-description: Sincroniza una skill personal desde Claude hacia un repositorio git local. Se invoca exclusivamente con /sync-skill seguido del nombre de la skill. Compara la skill cacheada en el sistema con su copia en el repo local, crea una rama, aplica los cambios y hace push. Usa esta skill cuando el usuario quiera sincronizar, actualizar, respaldar o bajar una skill a su repositorio local de skills.
+description: Sincroniza una skill personal desde Claude hacia un repositorio git local. Se invoca con /sync-skill seguido del nombre de la skill. Compara la skill cacheada en el sistema con su copia en el repo local y, si hay cambios reales, crea una rama, aplica los cambios y hace push; si no los hay, termina sin crear rama ni commit. Usa esta skill cuando el usuario quiera sincronizar, actualizar, respaldar o bajar una skill a su repositorio local de skills.
 ---
 
 # Sync Skill
@@ -68,7 +68,15 @@ Guarda la ruta encontrada en una variable (la llamaremos `SKILL_SOURCE` en los p
 Revisa si existe la carpeta `<nombre-skill>/` en la raíz del repositorio local. **Esta verificación es válida porque ya se hizo `git pull` en el Paso 3**, así que el filesystem refleja el estado real de master.
 
 - Si **no existe** → es una skill nueva (creación).
-- Si **existe** → compara recursivamente todo el contenido de la carpeta local contra `SKILL_SOURCE`. Usa `diff -r` para esto. Si no hay diferencias, informa al usuario que la skill ya está sincronizada y detente.
+- Si **existe** → compara recursivamente todo el contenido de la carpeta local contra `SKILL_SOURCE`. Si no hay diferencias, informa al usuario que la skill ya está sincronizada y detente.
+
+**La comparación debe ignorar los finales de línea.** El caché de Claude guarda los archivos con LF. En el repo de skills la causa raíz ya está resuelta: un `.gitattributes` en la raíz con `* text=auto eol=lf` garantiza que la copia de trabajo también se materialice en LF, así que el diff crudo da cero diferencias. Pero la skill puede correr contra un repo sin ese atributo configurado, y ahí `core.autocrlf=true` hace que git materialice CRLF apenas re-escribe los archivos (clon nuevo, `git checkout` de rama, `git pull`): un `diff -r` a secas reportaría TODOS los archivos como distintos aunque el contenido sea idéntico. Por eso `--strip-trailing-cr` se mantiene como defensa en profundidad. Úsalo siempre:
+
+```bash
+diff -r --strip-trailing-cr ./<nombre-skill> "$SKILL_SOURCE"
+```
+
+Guarda esta salida: el Paso 8 la usa para redactar el mensaje de commit.
 
 ### Paso 6: Crear la rama de trabajo
 
@@ -80,7 +88,16 @@ sync/<nombre-skill>/<fecha-YYYY-MM-DD>
 
 Por ejemplo: `sync/conversor-bolivia/2026-04-12`.
 
-Si la rama ya existe, agrega un sufijo incremental: `sync/conversor-bolivia/2026-04-12-2`, `sync/conversor-bolivia/2026-04-12-3`, etc.
+Si el nombre ya está tomado, agrega un sufijo incremental: `sync/conversor-bolivia/2026-04-12-2`, `sync/conversor-bolivia/2026-04-12-3`, etc.
+
+**"Ya está tomado" significa: existe como rama local O como rama remota conocida.** Basta con que aparezca en cualquiera de las dos para incrementar. El caso más común es una rama local que sobrevivió al merge de su PR y ya fue borrada del remoto: reutilizar ese nombre haría que el commit nuevo caiga sobre historia vieja, así que igual hay que incrementar.
+
+```bash
+git rev-parse --verify --quiet "refs/heads/<rama>" || \
+git rev-parse --verify --quiet "refs/remotes/origin/<rama>"
+```
+
+Si cualquiera de los dos devuelve un hash, el nombre está tomado. Ten en cuenta que las refs de `origin/` pueden estar desactualizadas — el Paso 3 solo trae `master`. Ante la duda, incrementar es siempre seguro.
 
 Crea la rama y posiciónate en ella:
 
@@ -97,11 +114,15 @@ Antes de copiar, **verifica defensivamente que la carpeta destino no existe**. S
 ```bash
 if [ -e "./<nombre-skill>" ]; then
   echo "❌ Error inesperado: la carpeta './<nombre-skill>' existe pero el Paso 5 la marcó como creación."
-  echo "   Aborta y revisa el estado del repo manualmente."
+  git checkout master
+  git branch -D <nombre-exacto-de-la-rama>
+  echo "   Se descartó la rama vacía creada en el Paso 6. Revisa el estado del repo manualmente."
   exit 1
 fi
 cp -r "$SKILL_SOURCE" ./<nombre-skill>
 ```
+
+Si esta verificación falla, **no ejecutes ningún paso posterior**: el `exit 1` solo termina ese comando de shell, no la ejecución de la skill — detenerte es responsabilidad tuya. Informa al usuario del error y no sigas. Borrar la rama no pierde información de diagnóstico: la carpeta inesperada vive en `master` y queda intacta.
 
 **Si es una actualización:** reemplaza todo el contenido de la carpeta local con el del caché. Elimina primero el contenido local para cubrir el caso donde se hayan eliminado archivos en la fuente.
 
@@ -117,29 +138,57 @@ Haz stage de todos los cambios y crea el commit. El mensaje siempre empieza con 
 Para generar la descripción:
 
 - **Skill nueva:** lee brevemente el SKILL.md para entender el propósito de la skill y descríbelo. Ejemplo: `sync/conversor-bolivia: add skill for bolivian unit conversions`
-- **Actualización:** usa la salida del `diff -r` del Paso 5 para resumir qué archivos cambiaron y la naturaleza del cambio en una oración. Ejemplo: `sync/saludo: update greeting message and add fallback response`
+- **Actualización:** usa la salida del `diff -r --strip-trailing-cr` del Paso 5 para resumir qué archivos cambiaron y la naturaleza del cambio en una oración. Ejemplo: `sync/saludo: update greeting message and add fallback response`
+
+**Guarda contra el commit vacío.** El Paso 5 puede detectar diferencias que `git add` termina no registrando como cambio real, por cualquier motivo: normalización aplicada por `.gitattributes`, archivos que git considera iguales, o un falso positivo del propio Paso 5. Si no queda nada staged, el `git commit` falla con "nothing to commit" y deja una rama huérfana sin commit, con el repo en un estado raro. Esta verificación es la red de seguridad: no depende de ninguna causa en particular, solo del hecho de que no hay nada que commitear.
 
 ```bash
 git add ./<nombre-skill>
+
+if git diff --cached --quiet; then
+  echo "ℹ️  Nada quedó staged: el contenido del repo ya es idéntico al del caché."
+  git checkout master
+  git branch -D <nombre-exacto-de-la-rama>
+  echo "✅ La skill ya estaba sincronizada. No se creó rama ni commit."
+  exit 0
+fi
+
 git commit -m "sync/<nombre-skill>: <descripcion-generada>"
 ```
 
+Si este guard se dispara, **no ejecutes los Pasos 9 y 10**: el `exit 0` solo termina ese comando de shell, no la ejecución de la skill — detenerte es responsabilidad tuya. Informa al usuario que la skill ya estaba sincronizada y no sigas.
+
 ### Paso 9: Push
 
-Sube la rama al repositorio remoto. Usa el nombre exacto de la rama creada en el Paso 6, incluyendo el sufijo incremental si fue necesario:
+Sube la rama al repositorio remoto. Usa el nombre exacto de la rama creada en el Paso 6, incluyendo el sufijo incremental si fue necesario.
+
+**Corre el push en background.** Este repo usa Git Credential Manager por HTTPS: en foreground el comando queda esperando autenticación y, con timeout corto, se mata solo antes de completar. Redirige la salida a un log y verifica después:
 
 ```bash
-git push origin <nombre-exacto-de-la-rama>
+git push origin <nombre-exacto-de-la-rama> > /tmp/push-<nombre-skill>.log 2>&1 &
 ```
+
+Para confirmar que terminó bien, revisa el log y comprueba que la ref remota quedó actualizada:
+
+```bash
+cat /tmp/push-<nombre-skill>.log
+git rev-parse --verify --quiet "refs/remotes/origin/<nombre-exacto-de-la-rama>"
+```
+
+Un push exitoso actualiza la rama de seguimiento, así que si el `rev-parse` devuelve un hash, el push llegó.
 
 ### Paso 10: Resultado
 
-Informa al usuario con un resumen:
+**Reporta según lo que haya devuelto la verificación del Paso 9. No afirmes que el push fue exitoso sin haberlo comprobado.**
+
+Si la verificación confirmó el push, informa al usuario con un resumen:
 
 - Nombre de la skill sincronizada
 - Tipo de operación (nueva o actualización)
 - Nombre de la rama creada
 - Que el push fue exitoso y puede crear el Pull Request en el repositorio remoto hacia `master`
+
+Si la verificación no confirmó el push, informa que el commit quedó hecho en la rama local pero el push no se completó, incluye el contenido del log, e indica que hay que reintentarlo manualmente. No menciones el Pull Request.
 
 ## Ejemplo de ejecución exitosa
 
@@ -152,6 +201,19 @@ Informa al usuario con un resumen:
   Push:      exitoso
 
   Puedes crear el Pull Request en el repositorio remoto hacia master.
+```
+
+## Ejemplo de skill ya sincronizada
+
+```
+ℹ️  La skill ya estaba sincronizada
+
+  Skill:     conversor-bolivia
+  Estado:    sin diferencias respecto del repositorio local
+  Rama:      no se creó
+  Commit:    no se creó
+
+  No hay nada que subir.
 ```
 
 ## Ejemplo de error (repo no válido)
